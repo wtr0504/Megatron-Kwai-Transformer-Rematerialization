@@ -8,6 +8,7 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
+from megatron.core import parallel_state as mpu
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
@@ -33,6 +34,14 @@ def get_batch(data_iterator):
     """Generate a batch"""
     args = get_args()
     tokenizer = get_tokenizer()
+
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    v_rank = mpu.get_virtual_pipeline_model_parallel_rank()
+    if v_rank is not None and not (pp_rank == 0 and v_rank == 0) and \
+            not (pp_rank == args.pipeline_model_parallel_size - 1 and v_rank == args.virtual_pipeline_model_parallel_size - 1) and \
+            args.use_flash_attn:
+        tokens, labels, loss_mask, attention_mask, position_ids = None, None, None, None, None
+        return tokens, labels, loss_mask, attention_mask, position_ids
 
     # Items and their type.
     keys = ['text']

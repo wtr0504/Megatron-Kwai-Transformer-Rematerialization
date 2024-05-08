@@ -5,21 +5,29 @@
 
 import math
 import os
-from typing import Optional
+from typing import Optional, Union
 import warnings
 
 import torch
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
+import transformer_engine
+import transformer_engine_extensions as tex
+from transformer_engine.pytorch.cpp_extensions import gemm as te_gemm
 
 from torch.cuda.amp import custom_fwd, custom_bwd
 
+from megatron.core.context_parallel import dattention, offload
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_global_memory_buffer,
+    get_context_parallel_world_size,
+    get_context_parallel_group,
+    get_context_parallel_group_slow,
+    get_global_te_user_buffer,
 )
 from .mappings import (
     copy_to_tensor_model_parallel_region,
@@ -28,6 +36,7 @@ from .mappings import (
     reduce_from_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    _reduce_scatter_along_first_dim,
 )
 
 from .random import get_cuda_rng_tracker
@@ -35,6 +44,8 @@ from .utils import (
     divide,
     split_tensor_along_last_dim,
     VocabUtility,
+    get_workspace,
+    get_ub_copy_stream
 )
 
 _grad_accum_fusion_available = True
@@ -212,21 +223,83 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
+fwd_rmsnorm_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+bwd_rmsnorm_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
+
+
+def tex_rmsnorm_fwd(
+    inp: torch.Tensor,
+    rmsnorm_weight: torch.Tensor,
+    eps: float,
+    zero_centered_gamma: bool,
+) -> torch.Tensor:
+    import transformer_engine.pytorch.cpp_extensions as tex
+
+    # Make sure input dimensions are compatible
+    in_features = rmsnorm_weight.numel()
+    assert inp.is_cuda, "TransformerEngine needs CUDA."
+    assert inp.shape[-1] == in_features, "RMSNorm not possible"
+    inputmat = inp.view((-1, in_features))
+
+    rmsnorm_out, rsigma = tex.rmsnorm_fwd(inputmat, rmsnorm_weight,
+                                          eps, fwd_rmsnorm_sm_margin,
+                                          zero_centered_gamma)
+    return rmsnorm_out.view_as(inp), rsigma
+
+
+def tex_rmsnorm_bwd(grad_output, inp, rmsnorm_weight, rsigma, zero_centered_gamma):
+    import transformer_engine.pytorch.cpp_extensions as tex
+
+    in_features = rmsnorm_weight.numel()
+    inputmat = inp.view((-1, in_features))
+    grad_output = grad_output.contiguous()
+    d_rmsnorm_out = grad_output.view(inputmat.shape)
+    dxmat, dgamma = tex.rmsnorm_bwd(
+        d_rmsnorm_out, inputmat, rsigma, rmsnorm_weight,
+        bwd_rmsnorm_sm_margin, zero_centered_gamma
+    )
+    return (
+        dxmat.view(inp.shape),
+        dgamma,
+    )
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
     @staticmethod
     @custom_fwd
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
-                async_grad_allreduce, sequence_parallel):
-        ctx.save_for_backward(input, weight)
+                async_grad_allreduce, sequence_parallel, ub_fw_obj, ub_bw_obj,
+                recompute_mlp_activation_func, activation_func,
+                recompute_norm, norm_weight, norm_eps, norm_zero_centered_gamma):
+        if recompute_mlp_activation_func and recompute_norm:
+            raise NotImplementedError("Recompute activation and recompute norm "
+                                      "cannot work together in the same Linear.")
+        ctx.recompute_mlp_activation_func = recompute_mlp_activation_func
+        ctx.activation_func = activation_func
+        ctx.recompute_norm = recompute_norm
+        ctx.norm_eps = norm_eps
+        ctx.norm_zero_centered_gamma = norm_zero_centered_gamma
+        if ctx.recompute_norm:
+            rms_output, rsigma = tex_rmsnorm_fwd(input, norm_weight, ctx.norm_eps, ctx.norm_zero_centered_gamma)
+            ctx.save_for_backward(input, weight, norm_weight)
+            input = rms_output
+        else:
+            ctx.save_for_backward(input, weight)
+
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel = sequence_parallel
-
-        if sequence_parallel:
-            world_size = get_tensor_model_parallel_world_size()
+        ctx.main_grad = weight.main_grad
+        ctx.ub_bw_obj = ub_bw_obj
+        if recompute_mlp_activation_func:
+            with torch.no_grad():
+                input = activation_func(input)
+        world_size = get_tensor_model_parallel_world_size()
+        rank_id = get_tensor_model_parallel_rank()
+        if sequence_parallel and ub_fw_obj is None:
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
@@ -240,7 +313,39 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
+        if ub_fw_obj is None:
+            output = torch.matmul(total_input, weight.t())
+        else:
+            partitial_input = None
+            out_dim_size = list(total_input.shape)
+            if(not sequence_parallel): # rs
+                output = torch.matmul(total_input, weight.t())
+                output = _reduce_scatter_along_first_dim(output)
+            else: # ag
+                out_dim_size[0]  = out_dim_size[0] * world_size
+                out_dim_size[-1] = weight.shape[0]
+                out = None
+                rs_out = None
+                ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
+                ub_fw_obj.copy_input_to_ubuf(input, True)
+                total_input = ub_fw_obj.get_ubuf_output(1)
+
+                output, _, _ = te_gemm(
+                    weight,
+                    total_input,
+                    total_input.dtype,
+                    get_workspace(),
+                    bias=None,
+                    use_bias=False,
+                    layout="TN",
+                    out=out,
+                    grad=False,
+                    ub_algo=ub_algo,
+                    ub=ub_fw_obj,
+                    extra_output_tensor=rs_out
+                )
+                output = output.view(out_dim_size)
+            
         if bias is not None:
             output = output + bias
         return output
@@ -248,8 +353,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
-        input, weight = ctx.saved_tensors
+        ub_bw_obj = ctx.ub_bw_obj
+        if ctx.recompute_norm:
+            norm_input, weight, norm_weight = ctx.saved_tensors
+            input, rsigma = tex_rmsnorm_fwd(norm_input, norm_weight, ctx.norm_eps, ctx.norm_zero_centered_gamma)
+        else:
+            input, weight = ctx.saved_tensors
+
         use_bias = ctx.use_bias
+        recompute_mlp_activation_func = ctx.recompute_mlp_activation_func
+
+        if recompute_mlp_activation_func:
+            activation_input = input
+            detach_inputs = activation_input.detach()
+            detach_inputs.requires_grad = activation_input.requires_grad
+            with torch.enable_grad():
+                silu_act_out = ctx.activation_func(detach_inputs)
+            input = silu_act_out.detach()
 
         if ctx.sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -268,7 +388,32 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = all_gather_buffer
         else:
             total_input = input
-        grad_input = grad_output.matmul(weight)
+        
+        grad_input = None
+        if ub_bw_obj is None:
+            grad_input = grad_output.matmul(weight)
+        else:
+            ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
+            dim_size = list(grad_output.shape)
+
+            ub_bw_obj.copy_input_to_ubuf(grad_output, True)
+            grad_output_all = ub_bw_obj.get_ubuf_output(1)
+            grad_input, _, _ = te_gemm(
+                weight,
+                grad_output_all,
+                grad_output_all.dtype,
+                get_workspace(),
+                bias=None,
+                use_bias=False,
+                layout="NN",
+                out=None,
+                grad=False,
+                ub_algo=ub_algo,
+                ub=ub_bw_obj,
+                extra_output_tensor=None
+            )
+            grad_output = grad_output_all.view([-1] + dim_size[1:])
+            grad_input = grad_input.view(list(grad_output.shape)[0:-1] + [-1])
 
         if ctx.sequence_parallel:
             handle.wait()
@@ -306,10 +451,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
 
         if ctx.gradient_accumulation_fusion:
-            if weight.main_grad.dtype == torch.float32:
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, weight.main_grad)
-            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, weight.main_grad)
+            if ctx.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, ctx.main_grad)
+            elif ctx.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, ctx.main_grad)
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
             grad_weight = None
@@ -319,12 +464,26 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel:
             handle.wait()
-            return sub_grad_input, grad_weight, grad_bias, None, None, None
+            if ctx.recompute_norm:
+                sub_grad_input, dgamma = tex_rmsnorm_bwd(sub_grad_input, norm_input, norm_weight, rsigma, ctx.norm_zero_centered_gamma)
+            else:
+                dgamma = None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None, dgamma, None, None
 
         if ctx.async_grad_allreduce:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None
+        if recompute_mlp_activation_func:
+            assert ctx.sequence_parallel is False, "recompute_mlp_activation_func is not implemented for none sequence parallel case"
+            torch.autograd.backward(silu_act_out, grad_input)
+            grad_input = detach_inputs.grad
+
+        if ctx.recompute_norm:
+            grad_input, dgamma = tex_rmsnorm_bwd(grad_input, norm_input, norm_weight, rsigma, ctx.norm_zero_centered_gamma)
+        else:
+            dgamma = None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None, dgamma, None, None
+
 
 def linear_with_grad_accumulation_and_async_allreduce(
     input: torch.Tensor,
@@ -333,6 +492,12 @@ def linear_with_grad_accumulation_and_async_allreduce(
     gradient_accumulation_fusion: bool,
     async_grad_allreduce: bool,
     sequence_parallel_enabled: bool,
+    ub_fw_obj: Union[tex.UbufCommOverlap, tex.UbufP2PCommOverlap] = None,
+    ub_bw_obj: Optional[tex.UbufP2PCommOverlap] = None,
+    recompute_mlp_activation_func = False,
+    activation_func = None,
+    recompute_norm: bool = False,
+    norm_module: Optional[torch.nn.Module] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -393,7 +558,16 @@ def linear_with_grad_accumulation_and_async_allreduce(
         gradient_accumulation_fusion,
         async_grad_allreduce,
         sequence_parallel_enabled,
+        ub_fw_obj,
+        ub_bw_obj,
+        recompute_mlp_activation_func,
+        activation_func,
+        recompute_norm,
     ]
+    if recompute_norm:
+        args += [norm_module.weight, norm_module.eps, norm_module.apply_layernorm_1p]
+    else:
+        args += [None, None, None]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
         if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
@@ -414,6 +588,275 @@ def linear_with_grad_accumulation_and_async_allreduce(
     return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
 
 linear_with_grad_accumulation_and_async_allreduce.warned = False
+
+
+class LinearQKVWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+    """See linear_with_grad_accumulation_and_async_allreduce"""
+
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
+                async_grad_allreduce, sequence_parallel, hidden_size_per_attention_head, k_pos_emb, ub_fw_obj,
+                recompute_norm, norm_weight, norm_eps, norm_zero_centered_gamma):
+        ctx.recompute_norm = recompute_norm
+        ctx.norm_eps = norm_eps
+        ctx.norm_zero_centered_gamma = norm_zero_centered_gamma
+        if ctx.recompute_norm:
+            rms_output, rsigma = tex_rmsnorm_fwd(input, norm_weight, ctx.norm_eps, ctx.norm_zero_centered_gamma)
+            ctx.save_for_backward(input, weight, k_pos_emb, norm_weight)
+            input = rms_output
+        else:
+            ctx.save_for_backward(input, weight, k_pos_emb)
+
+        ctx.use_bias = bias is not None
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.async_grad_allreduce = async_grad_allreduce
+        ctx.sequence_parallel = sequence_parallel
+        ctx.main_grad = weight.main_grad
+        ctx.ub_fw_obj = ub_fw_obj
+
+        if sequence_parallel and ub_fw_obj is None:
+            world_size = get_tensor_model_parallel_world_size()
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] * world_size
+
+            all_gather_buffer = \
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            torch.distributed._all_gather_base(
+                all_gather_buffer,
+                input,
+                group=get_tensor_model_parallel_group())
+            total_input = all_gather_buffer
+        else:
+            if ub_fw_obj is not None:
+                ub_fw_obj.copy_input_to_ubuf(input, True)
+                _, b, h = input.shape
+                total_input = ub_fw_obj.get_ubuf_output(1)
+                total_input = total_input.view(-1, b, h)
+            else:
+                total_input = input
+
+        s, b, h = total_input.shape
+        a = weight.shape[0] // 3 // hidden_size_per_attention_head
+        d = hidden_size_per_attention_head
+        kv = torch.empty(2, s * get_context_parallel_world_size(), b, a, d, dtype=total_input.dtype, device=total_input.device)
+        weight_q, weight_k, weight_v = weight.view(3, a * d, h)
+        if ctx.ub_fw_obj is None:
+            vi = torch.matmul(total_input, weight_v.t()).view(s, b, a, d)
+        else:
+            ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG
+            vi, _, _ = te_gemm(
+                weight_v,
+                total_input,
+                total_input.dtype,
+                get_workspace(),
+                bias=None,
+                use_bias=False,
+                layout="TN",
+                out=None,
+                grad=False,
+                ub_algo=ub_algo,
+                ub=ctx.ub_fw_obj,
+                extra_output_tensor=None
+            )
+            vi = vi.view(s, b, a, d)
+        assert vi is not None and vi.is_contiguous()
+        handle = torch.distributed.all_gather_into_tensor(kv[1], vi, group=get_context_parallel_group(), async_op=True)
+        ki = torch.matmul(total_input, weight_k.t()).view(s, b, a, d)
+        if k_pos_emb is not None:
+            import fast_rotary_pos_emb
+            ki = fast_rotary_pos_emb.forward(ki, k_pos_emb, True)
+        if b >= 2:
+            warnings.warn("There is a performance regression issue that can be fixed by customizing the fast_roraty_pos_emb output layout")
+            assert not ki.is_contiguous(), "Remove the branch if the performance regression issue is fixed"
+            ki = ki.contiguous()
+        handle.wait()
+        assert ki.is_contiguous()
+        handle = torch.distributed.all_gather_into_tensor(kv[0], ki, group=get_context_parallel_group(), async_op=True)
+        qi = torch.matmul(total_input, weight_q.t()).view(s, b, a, d)
+        handle.wait()
+        return qi, kv
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, *args):
+        use_fast_cat = True
+        use_addmm_inplace = True
+
+        if use_addmm_inplace:
+            from megatron.fused_kernels.wrap_gemm_api import addmm_inplace as addmm
+        else:
+            from torch import addmm
+
+        grad_qi, (grad_k, grad_v) = args
+        if ctx.recompute_norm:
+            norm_input, weight, k_pos_emb, norm_weight = ctx.saved_tensors
+            input, rsigma = tex_rmsnorm_fwd(norm_input, norm_weight, ctx.norm_eps, ctx.norm_zero_centered_gamma)
+        else:
+            input, weight, k_pos_emb = ctx.saved_tensors
+        use_bias = ctx.use_bias
+
+        s, b, a, d = grad_qi.shape
+        h = weight.shape[1]
+        weight_q, weight_k, weight_v = weight.view(3, a * d, h)
+        assert grad_qi.is_contiguous()
+        grad_ki = torch.empty_like(grad_qi)
+        assert grad_k.is_contiguous()
+        handle = torch.distributed.reduce_scatter_tensor(grad_ki, grad_k, group=get_context_parallel_group(), async_op=True)
+        grad_input = grad_qi.view(s, b, a * d).matmul(weight_q)
+        handle.wait()
+        grad_vi = torch.empty_like(grad_qi)
+        assert grad_v.is_contiguous()
+        handle = torch.distributed.reduce_scatter_tensor(grad_vi, grad_v, group=get_context_parallel_group(), async_op=True)
+        if k_pos_emb is not None:
+            import fast_rotary_pos_emb
+            grad_ki = fast_rotary_pos_emb.backward(grad_ki, k_pos_emb, True)
+        grad_input = addmm(grad_input.view(s * b, h), grad_ki.view(s * b, a * d), weight_k).view(s, b, h)
+        handle.wait()
+
+        if ctx.sequence_parallel:
+            world_size = get_tensor_model_parallel_world_size()
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] * world_size
+
+            all_gather_buffer = \
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            handle = torch.distributed._all_gather_base(
+                all_gather_buffer,
+                input,
+                group=get_tensor_model_parallel_group(), async_op=True)
+
+            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+            # gather is scheduled before the input gradient computation
+            total_input = all_gather_buffer
+        else:
+            total_input = input
+
+        grad_input = addmm(grad_input.view(s * b, h), grad_vi.view(s * b, a * d), weight_v).view(s, b, h)
+        if use_fast_cat:
+            import fast_cat_cuda
+            grad_output = torch.empty(s, b, 3 * a * d, dtype=grad_qi.dtype, device=grad_qi.device)
+            fast_cat_cuda.cat([grad_qi.data_ptr(), grad_ki.data_ptr(), grad_vi.data_ptr()], grad_output.data_ptr(),
+                              s * b, a * d * grad_output.element_size(), torch.cuda.current_stream().cuda_stream)
+        else:
+            grad_output = torch.concat([grad_qi, grad_ki, grad_vi], dim=2)
+            grad_output = grad_output.view(s, b, 3 * a * d)
+
+        if ctx.sequence_parallel:
+            handle.wait()
+
+        # Doing gather + slicing during the NeMo forward pass can make this tensor 
+        # not be contiguous. PyTorch only checks if the tensor is contiguous, and only 
+        # clones it if it's not contiguous: 
+        # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
+        grad_output = grad_output.contiguous()
+        # Convert the tensor shapes to 2D for execution compatibility
+        grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
+                                       grad_output.shape[2])
+        total_input = total_input.view(total_input.shape[0] * total_input.shape[1],
+				       total_input.shape[2])
+
+        if ctx.async_grad_allreduce:
+            # Asynchronous all-reduce
+            handle = torch.distributed.all_reduce(
+                    grad_input, group=get_tensor_model_parallel_group(), async_op=True)
+            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+            # all-reduce is scheduled before the weight gradient computation
+
+        if ctx.sequence_parallel:
+            assert not ctx.async_grad_allreduce
+            dim_size = list(input.size())
+            sub_grad_input = torch.empty(dim_size, dtype=input.dtype,
+                                         device=torch.cuda.current_device(),
+                                         requires_grad=False)
+            # reduce_scatter
+            handle = torch.distributed._reduce_scatter_base(sub_grad_input, grad_input,
+                                                            group=get_tensor_model_parallel_group(),
+                                                            async_op=True)
+            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+            # reduce scatter is scheduled before the weight gradient computation
+
+
+        if ctx.gradient_accumulation_fusion:
+            if ctx.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, ctx.main_grad)
+            elif ctx.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, ctx.main_grad)
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+            grad_weight = None
+        else:
+            grad_weight = grad_output.t().matmul(total_input)
+        grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        if ctx.sequence_parallel:
+            handle.wait()
+            if ctx.recompute_norm:
+                sub_grad_input, dgamma = tex_rmsnorm_bwd(sub_grad_input, norm_input, norm_weight, rsigma, ctx.norm_zero_centered_gamma)
+            else:
+                dgamma = None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, dgamma, None, None
+
+        if ctx.async_grad_allreduce:
+            handle.wait()
+
+        if ctx.recompute_norm:
+            grad_input, dgamma = tex_rmsnorm_bwd(grad_input, norm_input, norm_weight, rsigma, ctx.norm_zero_centered_gamma)
+        else:
+            dgamma = None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, dgamma, None, None
+
+
+def linear_qkv_with_grad_accumulation_and_async_allreduce(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    gradient_accumulation_fusion: bool,
+    async_grad_allreduce: bool,
+    sequence_parallel_enabled: bool,
+    hidden_size_per_attention_head: int,
+    k_pos_emb: torch.Tensor,
+    ub_fw_obj: Optional[tex.UbufP2PCommOverlap],
+    recompute_norm: bool,
+    norm_module: Optional[torch.nn.Module],
+) -> torch.Tensor:
+    args = [
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        async_grad_allreduce,
+        sequence_parallel_enabled,
+        hidden_size_per_attention_head,
+        k_pos_emb,
+        ub_fw_obj,
+        recompute_norm,
+    ]
+    if recompute_norm:
+        args += [norm_module.weight, norm_module.eps, norm_module.apply_layernorm_1p]
+    else:
+        args += [None, None, None]
+
+    if not linear_qkv_with_grad_accumulation_and_async_allreduce.warned:
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+            if sequence_parallel_enabled:
+                warnings.warn(
+                    "When using sequence parallelism it is recommended to set the "
+                    "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for "
+                    "maximum speedup")
+                linear_qkv_with_grad_accumulation_and_async_allreduce.warned = True
+
+            if async_grad_allreduce:
+                warnings.warn(
+                    "When using async grad allreduce it is recommended to set the "
+                    "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for "
+                    "maximum speedup")
+                linear_qkv_with_grad_accumulation_and_async_allreduce.warned = True
+
+    return LinearQKVWithGradAccumulationAndAsyncCommunication.apply(*args)
+
+linear_qkv_with_grad_accumulation_and_async_allreduce.warned = False
+
 
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
@@ -457,6 +900,9 @@ class ColumnParallelLinear(torch.nn.Module):
                  perform_initialization=True,
                  gradient_accumulation_fusion=False,
                  sequence_parallel_enabled: bool = False,
+                 cp_overlap: bool = False,
+                 hidden_size_per_attention_head: int = -1,
+                 ub_obj: Optional[tex.UbufP2PCommOverlap] = None
                  ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -468,6 +914,7 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
+        self.ub_obj = ub_obj
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -506,6 +953,11 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
 
+        self.cp_overlap = cp_overlap
+        self.hidden_size_per_attention_head = hidden_size_per_attention_head
+        if cp_overlap and perform_initialization:
+            self.convert_to_cp_overlap_weights()
+
         self.async_tensor_model_parallel_allreduce = (
                 async_tensor_model_parallel_allreduce and
                 world_size > 1)
@@ -538,7 +990,7 @@ class ColumnParallelLinear(torch.nn.Module):
             )
 
 
-    def forward(self, input_):
+    def forward(self, input_, k_pos_emb=None, norm_input=None, norm_module=None):
         """Forward of ColumnParallelLinear
 
         Args:
@@ -548,6 +1000,11 @@ class ColumnParallelLinear(torch.nn.Module):
             - output
             - bias
         """
+        if input_ is None:
+            recompute_norm = True
+            input_ = norm_input
+        else:
+            recompute_norm = False
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
@@ -556,14 +1013,32 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = linear_with_grad_accumulation_and_async_allreduce(
-            input=input_parallel,
-            weight=self.weight,
-            bias=bias,
-            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
-        )
+        if self.cp_overlap:
+            output_parallel = linear_qkv_with_grad_accumulation_and_async_allreduce(
+                input=input_parallel,
+                weight=self.weight,
+                bias=bias,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                hidden_size_per_attention_head=self.hidden_size_per_attention_head,
+                k_pos_emb=k_pos_emb,
+                ub_fw_obj=self.ub_obj,
+                recompute_norm=recompute_norm,
+                norm_module=norm_module,
+            )
+        else:
+            output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+                input=input_parallel,
+                weight=self.weight,
+                bias=bias,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                ub_fw_obj=self.ub_obj,
+                recompute_norm=recompute_norm,
+                norm_module=norm_module,
+            )
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel_enabled
@@ -572,6 +1047,16 @@ class ColumnParallelLinear(torch.nn.Module):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def convert_to_cp_overlap_weights(self):
+        assert self.bias is None, "bias is not implemented when cp_overlap is enabled"
+        weight_qkv_3adh = self.weight.data.view(-1, 3, self.hidden_size_per_attention_head, self.weight.shape[1]).transpose(0, 1)
+        self.weight.data.copy_(weight_qkv_3adh.reshape(self.weight.shape).clone())
+
+    def convert_from_cp_overlap_weights(self):
+        assert self.bias is None, "bias is not implemented when cp_overlap is enabled"
+        weight_qkv_a3dh = self.weight.data.view(3, -1, self.hidden_size_per_attention_head, self.weight.shape[1]).transpose(0, 1)
+        self.weight.data.copy_(weight_qkv_a3dh.reshape(self.weight.shape).clone())
 
 
 class RowParallelLinear(torch.nn.Module):
@@ -621,6 +1106,8 @@ class RowParallelLinear(torch.nn.Module):
                  perform_initialization=True,
                  gradient_accumulation_fusion=False,
                  sequence_parallel_enabled: bool = False,
+                 ub_fw_obj=None,
+                 ub_bw_obj=None
                  ):
         super(RowParallelLinear, self).__init__()
 
@@ -634,6 +1121,8 @@ class RowParallelLinear(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.ub_fw_obj = ub_fw_obj
+        self.ub_bw_obj = ub_bw_obj
         if self.sequence_parallel_enabled and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
 
@@ -676,7 +1165,7 @@ class RowParallelLinear(torch.nn.Module):
 
 
 
-    def forward(self, input_):
+    def forward(self, input_, cp_data_to_save=None, cp_overlap_phase=None, recompute_mlp_activation_func=False, activation_func=None):
         """Forward of RowParallelLinear
 
         Args:
@@ -700,11 +1189,32 @@ class RowParallelLinear(torch.nn.Module):
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
+            ub_fw_obj=self.ub_fw_obj,
+            ub_bw_obj=self.ub_bw_obj,
+            recompute_mlp_activation_func=recompute_mlp_activation_func,
+            activation_func=activation_func
         )
+
+        if cp_data_to_save is not None:
+            # Phase 2: to_out
+            # Phase 3: 4h_to_h
+            if isinstance(cp_data_to_save, (tuple, list)):  # offload
+                if cp_overlap_phase == 2:
+                    output_parallel, *cp_data_to_save_next = offload.offload_phase2(output_parallel, *cp_data_to_save)
+            else:  # shard save
+                if cp_overlap_phase == 2:
+                    cp_data_to_save_next = cp_data_to_save
+                elif cp_overlap_phase == 3:
+                    output_parallel = dattention.shard_save_for_backward(output_parallel, cp_data_to_save, group=get_context_parallel_group_slow())
+                    cp_data_to_save_next = None
 
         # All-reduce across all the partitions.
         if self.sequence_parallel_enabled:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            if self.ub_fw_obj is None:
+                output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+
+            else:
+                output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
@@ -713,4 +1223,13 @@ class RowParallelLinear(torch.nn.Module):
         else:
             output = output_
             output_bias = self.bias
+
+        if cp_data_to_save is not None:
+            if isinstance(cp_data_to_save, (tuple, list)):  # offload
+                if cp_overlap_phase == 3:
+                    output = offload.offload_phase3(output, *cp_data_to_save)
+                    cp_data_to_save_next = None
+
+        if cp_data_to_save is not None:
+            return output, output_bias, cp_data_to_save_next
         return output, output_bias

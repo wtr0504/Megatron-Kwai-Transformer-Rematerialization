@@ -7,6 +7,8 @@ import math
 import torch
 
 from megatron import get_args
+from megatron.core import mpu
+from megatron.core.context_parallel import dattention
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
@@ -52,3 +54,29 @@ def openai_gelu(x):
 @torch.jit.script
 def erf_gelu(x):
     return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
+
+
+def slice_lm_inputs_along_cp(input_ids, position_ids, attention_mask, labels):
+    if input_ids is None:  # no data loaded
+        return input_ids, position_ids, attention_mask, labels
+    CP = mpu.get_context_parallel_world_size()
+    if CP >= 2:
+        # Check inputs with the same context parallel rank are equal
+        args = get_args()
+        if args.curr_iteration < args.iteration + args.kaimm_warmup_iters:
+            max_input_ids = input_ids.clone()
+            torch.distributed.all_reduce(max_input_ids, op=torch.distributed.ReduceOp.MAX,
+                                         group=mpu.get_context_parallel_group())
+            if (max_input_ids != input_ids).any():
+                raise ValueError("Inputs with the same get_data_parallel_for_sample_rank() should be equal. "
+                                 "Please check the dataloader.")
+
+        cp_rank = mpu.get_context_parallel_rank()
+        input_ids = dattention.slice_cp(input_ids, 1, CP, cp_rank)
+        position_ids = dattention.slice_cp(position_ids, 1, CP, cp_rank)
+        labels = dattention.slice_cp(labels, 1, CP, cp_rank)
+    return input_ids, position_ids, attention_mask, labels
+
+
+def gather_post_lm_output_along_cp(output):
+    return dattention.forward_gather_backward_slice(output, 1, mpu.get_context_parallel_group())

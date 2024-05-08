@@ -5,7 +5,13 @@ from functools import reduce
 import operator
 
 import torch
+try:
+    import transformer_engine
+    import transformer_engine_extensions as tex
+except:
+    tex = None
 
+from megatron import get_args
 from megatron.core import parallel_state
 
 
@@ -57,6 +63,50 @@ class GlobalMemoryBuffer:
                             requires_grad=False)
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+class GlobalTEUserBuffer:
+    """Global Transformer Engine UserBuffer """
+
+    def __init__(self):
+        self.buffer_ag = {}
+        self.buffer_rs = {}
+        assert tex is not None, "Using Transformer Engine userbuffer, please install transformer engine first."
+        self.set_sm_margin = 1
+        self.cga_size = 2
+        self._NUM_MAX_UB_STREAMS = 2
+        self.aggregate = 0
+
+    def get_ub(self, name, shape, dtype, tp_world_size, tp_rank_id, ag):
+        if(ag):
+            if(name not in self.buffer_ag):
+                sample_buffer = torch.empty(shape, dtype = dtype, device="cuda")
+                self.buffer_ag[name] = tex.UbufP2PCommOverlap(
+                    sample_buffer,          # Sample userbuffer
+                    tp_rank_id,             # Rank id
+                    tp_world_size,          # TP size
+                    tp_world_size * 2,      # Number of communication SMs
+                    self.cga_size,          # CGA cluster size
+                    self.set_sm_margin,     # Set SM margin
+                    self.aggregate,         # Aggregate 2X GEMM chunks
+                    3,                      # Max concurrent GEMM streams
+                    torch.Tensor(),         # empty tensor to pass to counters
+                )
+            return self.buffer_ag[name]
+        else:
+            if(name not in self.buffer_rs):
+                sample_buffer = torch.empty(shape, dtype = dtype, device="cuda")
+                self.buffer_rs[name] = tex.UbufCommOverlap(
+                    sample_buffer,          # Sample userbuffer
+                    tp_rank_id,             # Rank id
+                    tp_world_size,          # TP size
+                    tp_world_size * 2,      # Number of communication SMs
+                    self.cga_size,          # CGA cluster size
+                    tp_world_size,          # Number of communication splits
+                    self.set_sm_margin,     # Set SM margin
+                    3,                      # Max concurrent GEMM streams
+                    torch.Tensor(),         # empty tensor to pass to counters
+                )
+            return self.buffer_rs[name]
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
     '''Make a viewless tensor.
@@ -135,3 +185,30 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
     '''
     assert_viewless_tensor(tensor, extra_msg = "FYI, tensor._base has shape %s, and new_data_tensor has shape %s." % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape))
     tensor.data = new_data_tensor
+
+
+_SYNC_EVENT = None
+
+
+class SyncAtBackwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, sync_level):
+        ctx.sync_level = sync_level
+        return x
+
+    def backward(ctx, grad_output):
+        cuda_sync_and_record(sync_level=ctx.sync_level)
+        return grad_output, None
+
+
+def cuda_sync_and_record(*, sync_level):
+    if sync_level <= get_args().kaimm_cuda_synchronize_level:
+        global _SYNC_EVENT 
+        if _SYNC_EVENT is None:
+            _SYNC_EVENT = torch.cuda.Event()
+        _SYNC_EVENT.synchronize()
+        _SYNC_EVENT.record()
+
+
+def cuda_sync_and_record_at_backward(x, *, sync_level):
+    return SyncAtBackwardFunction.apply(x, sync_level)

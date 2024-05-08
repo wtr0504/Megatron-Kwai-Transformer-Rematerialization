@@ -1,0 +1,8 @@
+# Llama-1: Page 3, https://arxiv.org/pdf/2302.13971v1.pdf
+
+export NUM_LAYERS=96           # GPT-3: Page 8, https://arxiv.org/pdf/2005.14165v4.pdf
+export HIDDEN_SIZE=12288       # GPT-3: Page 8, https://arxiv.org/pdf/2005.14165v4.pdf
+export FFN_HIDDEN_SIZE=32768
+export NUM_ATTENTION_HEADS=$((HIDDEN_SIZE / 128))  # GPT-3: Page 8, https://arxiv.org/pdf/2005.14165v4.pdf
+export GQA=0
+export NUM_QUERY_GROUPS=

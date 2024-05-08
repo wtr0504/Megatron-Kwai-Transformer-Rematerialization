@@ -74,6 +74,47 @@ def load(args):
         scaled_softmax_cuda = _cpp_extention_load_helper(
             "scaled_softmax_cuda", sources, extra_cuda_flags)
 
+    # ==========
+    # Fast RoPE.
+    # ==========
+
+    if args.use_fast_rope:
+        extra_cuda_flags = ['-U__CUDA_NO_HALF_OPERATORS__',
+                            '-U__CUDA_NO_HALF_CONVERSIONS__',
+                            '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
+                            '--fmad=false']
+
+        # Rotary pos emb
+        sources=[srcpath / 'fast_rotary_pos_emb.cpp',
+                 srcpath / 'fast_rotary_pos_emb.cu']
+        fast_rotary_pos_emb = _cpp_extention_load_helper(
+            "fast_rotary_pos_emb", sources, extra_cuda_flags)
+
+    # =================
+    # Context parallel.
+    # =================
+
+    if args.context_parallel_size >= 2 or args.kaimm_offload_activation_ratio > 0:
+        extra_cuda_flags = []
+
+        # Fast flip
+        sources=[srcpath / 'fast_flip.cpp',
+                 srcpath / 'fast_flip_cuda.cu']
+        fast_rotary_pos_emb = _cpp_extention_load_helper(
+            "fast_flip_cuda", sources, extra_cuda_flags)
+
+        # Fused mma
+        sources=[srcpath / 'wrap_gemm.cpp',
+                 srcpath / 'wrap_gemm_cuda.cu']
+        fast_rotary_pos_emb = _cpp_extention_load_helper(
+            "wrap_gemm_cuda", sources, extra_cuda_flags)
+
+        # Fast cat
+        sources=[srcpath / 'fast_cat.cpp',
+                 srcpath / 'fast_cat_cuda.cu']
+        fast_rotary_pos_emb = _cpp_extention_load_helper(
+            "fast_cat_cuda", sources, extra_cuda_flags)
+
 
 def _get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],

@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron import get_args
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -72,18 +73,37 @@ def broadcast_data(keys, data, datatype):
         datatype: torch data type of all tensors in data associated
                   with keys.
     """
+    args = get_args()
+
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
-    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys,
-                                                                          data)
+    if args.kaimm_async_dataloader and not args.variable_seq_lengths and keys == ["text"]:
+        b = args.micro_batch_size
+        s = args.seq_length
+        if get_tensor_model_parallel_rank() == 0:
+            assert data["text"].shape == torch.Size([b, s + 1]), f'{data["text"].shape} vs {torch.Size([b, s + 1])}'
+        key_size = {"text": [b, s + 1]}
+        key_numel = {"text": b * (s + 1)}
+        total_numel = b * (s + 1)
+    else:
+        key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys,
+                                                                              data)
 
     # Pack on rank zero.
     if get_tensor_model_parallel_rank() == 0:
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat(
-            [data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+        if args.kaimm_async_dataloader:
+            flatten_data = [data[key].contiguous().view(-1) for key in keys]
+            if len(flatten_data) == 1:
+                flatten_data = flatten_data[0]
+            else:
+                flatten_data = torch.cat(flatten_data, dim=0)
+            flatten_data = flatten_data.cuda(non_blocking=True)
+        else:
+            flatten_data = torch.cat(
+                [data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
     else:
         flatten_data = torch.empty(total_numel,
                                    device=torch.cuda.current_device(),

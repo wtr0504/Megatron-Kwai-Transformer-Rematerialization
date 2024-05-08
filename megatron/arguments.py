@@ -35,6 +35,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_llama_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -49,6 +50,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+
+    # launch from mpi
+    if int(os.getenv('OMPI_COMM_WORLD_SIZE', '0')) > 0:
+        args.rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        args.local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+        args.world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
 
     return args
 
@@ -76,13 +83,18 @@ def validate_args(args, defaults={}):
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
+    assert args.data_parallel_size % args.context_parallel_size == 0, 'data' \
+        ' parallel size ({}) is not divisible by context parallel size({})' \
+        .format(args.data_parallel_size, args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel-size: {}, '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}, '
+              'context-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.tensor_model_parallel_size,
-                  args.pipeline_model_parallel_size), flush=True)
+                  args.pipeline_model_parallel_size,
+                  args.context_parallel_size), flush=True)
     if args.pipeline_model_parallel_size > 1:
         if args.pipeline_model_parallel_split_rank is not None:
             assert args.pipeline_model_parallel_split_rank < \
@@ -246,15 +258,15 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        args.ffn_hidden_size = 4 * args.hidden_size
-
-    if args.swiglu:
-        # reduce the dimnesion for MLP since projections happens on
-        # two linear layers. this keeps the number of paramters in
-        # the same ballpark as the counterpart with 4*h size
-        # we keep it a multiple of 64, which means the actual tensor size
-        # will be a multiple of 64 / tp_size
-        args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+        if args.swiglu:
+            # reduce the dimnesion for MLP since projections happens on
+            # two linear layers. this keeps the number of paramters in
+            # the same ballpark as the counterpart with 4*h size
+            # we keep it a multiple of 64, which means the actual tensor size
+            # will be a multiple of 64 / tp_size
+            args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+        else:
+            args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
@@ -340,7 +352,11 @@ def validate_args(args, defaults={}):
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
+    
+    if args.async_tensor_model_parallel_allreduce or args.sequence_parallel:
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
+    # print(f"rank={args.rank}, CUDA_DEVICE_MAX_CONNECTIONS={os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS')}")
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
@@ -350,6 +366,20 @@ def validate_args(args, defaults={}):
             raise RuntimeError(
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
+    if args.kaimm_cp_offload_mode != 0 and not args.context_parallel_comm_overlap_gemm:
+        raise NotImplementedError("CP offload requires overlap")
+
+    assert 0. <= args.kaimm_offload_activation_ratio <= 1.
+    if args.kaimm_offload_activation_ratio and args.pipeline_model_parallel_size <= 2:
+        raise RuntimeError("Offload requires PP >= 3")
+
+    if args.tensor_model_parallel_size == 1:
+        args.overlap_sp_ag = False
+        args.overlap_sp_rs = False
+
+    if args.overlap_sp_ag or args.overlap_sp_rs:
+        assert args.sequence_parallel, "Please enable sequence parallel for sp overlap optimization."
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -373,6 +403,18 @@ def validate_args(args, defaults={}):
     if retro_args and args != retro_args:
         _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
 
+    # Print env var
+    if args.rank == 0:
+        for env_key in sorted([
+            "CUDA_DEVICE_MAX_CONNECTIONS",
+            "NCCL_IB_QPS_PER_CONNECTION",
+            "NVTE_BWD_LAYERNORM_SM_MARGIN",
+            "NVTE_FWD_LAYERNORM_SM_MARGIN",
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "TORCH_NCCL_AVOID_RECORD_STREAMS",
+        ]):
+            print("env", env_key, os.environ.get(env_key))
+
     return args
 
 
@@ -393,6 +435,19 @@ def _print_args(title, args):
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
+
+
+def _add_llama_args(parser):
+    group = parser.add_argument_group(title='llama')
+
+    group.add_argument('--rms-norm',
+                       action='store_true', default=False,
+                       help='Using RMSLayerNorm.')
+    group.add_argument('--use-fast-rms-norm',  action='store_true',
+                       help='use Fast rms norm.')
+    group.add_argument('--use-fast-rope',  action='store_true',
+                       help='use Fast rotary position embedding.')
+    return parser
 
 
 def _add_transformer_engine_args(parser):
@@ -512,6 +567,10 @@ def _add_network_size_args(parser):
                        'attention. This is set to '
                        '   args.hidden_size // args.num_attention_heads '
                        'if not provided.')
+    group.add_argument('--group-query-attention', action='store_true',
+                          help='Use group-query attention.')
+    group.add_argument('--num-query-groups', type=int, default=1)
+
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -549,6 +608,9 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+    group.add_argument('--disable-output-scale-init', action='store_true', default=False,
+                       help='Standard deviation of the zero mean normal '
+                            'distribution used for weight initialization.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
@@ -696,6 +758,10 @@ def _add_training_args(parser):
                        'whole transformer layer is recomputed, '
                        '2) selective: core attention part of the transformer '
                        'layer is recomputed.')
+    group.add_argument('--kaimm-recompute-mlp-activation-func', action='store_true',
+                       help='Recompute activation between parallel MLP linears')
+    group.add_argument('--kaimm-recompute-norm', action='store_true',
+                       help='Recompute RMSNorm to save memory')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -714,6 +780,10 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
+                       help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
+                       dest='clone_scatter_output_in_embedding')
+
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -727,6 +797,14 @@ def _add_training_args(parser):
                        help='Total number of samples to train over all '
                        'training runs. Note that either train-iters or '
                        'train-samples should be provided.')
+    group.add_argument('--kaimm-warmup-iters', type=int, default=0,
+                       help='Total number of iterations to check correctness '
+                       'or tune performance')
+    group.add_argument('--kaimm-cuda-synchronize-level', type=int, default=0,
+                       help='How often to synchronize with CUDA')
+    group.add_argument('--kaimm-gc-interval', type=int, default=0,
+                       help='Manual GC interval. Zero indicates the default '
+                       'GC mechanism')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
@@ -768,6 +846,11 @@ def _add_training_args(parser):
                        'tensor-model-parallel all-reduce with weight '
                        'gradient compuation of a column-linear layer.',
                        dest='async_tensor_model_parallel_allreduce')
+    group.add_argument('--no-context-parallel-comm-overlap-gemm',
+                       action='store_false',
+                       help='Disable overlap of context-parallel communication '
+                       'and QKV gemm',
+                       dest='context_parallel_comm_overlap_gemm')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
@@ -780,6 +863,12 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--overlap-sp-ag',
+                       action='store_true',
+                       help='Enable all gather overlapping for sequence parallel.')
+    group.add_argument('--overlap-sp-rs',
+                       action='store_true',
+                       help='Enable reduce scatter overlapping for sequence parallel')
     return parser
 
 
@@ -929,6 +1018,8 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--context-parallel-size', type=int, default=1,
+                       help='Degree of context parallelism.')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
                        help='Rank where encoder and decoder should be split.')
@@ -941,6 +1032,17 @@ def _add_distributed_args(parser):
                        action='store_true',
                        help='overlap pipeline parallel communication with forward and backward chunks',
                        dest='overlap_p2p_comm')
+    group.add_argument('--kaimm-cp-offload-mode', type=int, default=0,
+                       choices=[0, 1, 2],
+                       help='Which method to retrieve KV in backward. '
+                       '0: gather inter-node; 1: offload; 2: offload + gather intra-node')
+    group.add_argument('--kaimm-overlap-cp-slow-ctas', type=int, default=None,
+                       help='number of NCCL CTAs for overlapped CP backward gather KV communication')
+    group.add_argument('--kaimm-profile-analysis', action='store_true',
+                       default=False, help='Record timing info for analysis purpose. '
+                       'Pipeline performance will go down due to synchronization.')
+    group.add_argument('--kaimm-offload-activation-ratio', type=float, default=0.,
+                       help='The proportion of offloaded activations relative to total activations.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -1065,6 +1167,8 @@ def _add_data_args(parser):
                        help='Warm up mmap files.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--prefetch-factor', type=int, default=2,
+                       help="Dataloader number of prefetch.")
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
@@ -1086,6 +1190,8 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--kaimm-async-dataloader', action='store_true',
+                       help='Load data in an async way.')
 
     return parser
 

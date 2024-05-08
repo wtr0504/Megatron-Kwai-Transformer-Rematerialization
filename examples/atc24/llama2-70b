@@ -1,0 +1,8 @@
+# Llama-2: https://arxiv.org/pdf/2307.09288v2.pdf
+
+export NUM_LAYERS=80
+export HIDDEN_SIZE=8192
+export FFN_HIDDEN_SIZE=28672  # https://huggingface.co/codellama/CodeLlama-70b-hf/blob/main/config.json
+export NUM_ATTENTION_HEADS=$((HIDDEN_SIZE / 128))
+export GQA=1
+export NUM_QUERY_GROUPS=8     # https://huggingface.co/codellama/CodeLlama-70b-hf/blob/main/config.json

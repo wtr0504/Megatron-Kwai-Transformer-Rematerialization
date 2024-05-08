@@ -78,6 +78,20 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
+def get_memory_info_for_current_gpu():
+    import cuda.cuda
+    import cuda.cudart
+    import pynvml
+    import uuid
+    err, device_id = cuda.cudart.cudaGetDevice()
+    assert err == cuda.cudart.cudaError_t.cudaSuccess
+    err, device_uuid = cuda.cuda.cuDeviceGetUuid(device_id)
+    assert err == cuda.cuda.CUresult.CUDA_SUCCESS
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    return pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+
 def report_memory(name):
     """Simple GPU memory report."""
     mega_bytes = 1024.0 * 1024.0
@@ -93,6 +107,21 @@ def report_memory(name):
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
               flush=True)
+    memory_info = get_memory_info_for_current_gpu()
+    data = torch.tensor([torch.cuda.max_memory_allocated(),
+                         torch.cuda.memory_reserved(),
+                         torch.cuda.max_memory_reserved(),
+                         memory_info.used,
+                         memory_info.total],
+                        dtype=torch.long, device="cuda")
+    torch.distributed.all_reduce(data, op=torch.distributed.ReduceOp.MAX)
+    data = data.tolist()
+    if torch.distributed.get_rank() == 0:
+        print("max_memory_allocated", data[0])
+        print("memory_reserved", data[1])
+        print("max_memory_reserved", data[2])
+        print("memory_info.used", data[3])
+        print("memory_info.total", data[4])
 
 
 def print_params_min_max_norm(optimizer, iteration):
@@ -139,6 +168,8 @@ def get_ltor_masks_and_position_ids(data,
                                     eod_mask_loss):
     """Build masks and position id for left to right model."""
 
+    args = get_args()
+
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
 
@@ -147,9 +178,10 @@ def get_ltor_masks_and_position_ids(data,
         att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
-    attention_mask = torch.tril(torch.ones(
-        (att_mask_batch, seq_length, seq_length), device=data.device)).view(
-            att_mask_batch, 1, seq_length, seq_length)
+    if not args.use_flash_attn:
+        attention_mask = torch.tril(torch.ones(
+            (att_mask_batch, seq_length, seq_length), device=data.device)).view(
+                att_mask_batch, 1, seq_length, seq_length)
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -187,7 +219,10 @@ def get_ltor_masks_and_position_ids(data,
                     prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = (attention_mask < 0.5)
+    if args.use_flash_attn:
+        attention_mask = None
+    else:
+        attention_mask = (attention_mask < 0.5)
 
     return attention_mask, loss_mask, position_ids
 

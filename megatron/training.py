@@ -3,6 +3,7 @@
 """Pretrain utilities."""
 
 from datetime import datetime
+import gc
 import math
 import sys
 import time
@@ -39,6 +40,7 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
+from megatron.profile_utils import annotate_range, enable_perf_model, perf_model_summary, perf_model_clear
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
@@ -424,7 +426,7 @@ def train_step(forward_step_func, data_iterator,
         model=model,
         num_microbatches=get_num_microbatches(),
         dtype=args.params_dtype,
-        tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
+        tensor_shape=(args.seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
         grad_scaler=optimizer.scale_loss,
         sequence_parallel=args.sequence_parallel,
         overlap_p2p_comm=args.overlap_p2p_comm,
@@ -465,7 +467,8 @@ def train_step(forward_step_func, data_iterator,
     if update_successful:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
-                    args.data_parallel_size
+                    args.data_parallel_size // \
+                    args.context_parallel_size
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
@@ -551,7 +554,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'optimizer']
 
     # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * \
+    batch_size = args.micro_batch_size * \
+        (args.data_parallel_size // args.context_parallel_size) * \
         get_num_microbatches()
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
@@ -621,12 +625,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
                                   elapsed_time_per_iteration, iteration)
+
+        samples_per_second = args.global_batch_size / elapsed_time_per_iteration
+        tokens_per_sec_per_replica = samples_per_second * args.seq_length  / args.world_size
+
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += ' tokens per sec per gpu: {:.5f} |'.format(tokens_per_sec_per_replica)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -655,13 +664,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
-            report_memory_flag = False
+            report_memory_flag -= 1
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
 
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
+    args = get_args()
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
@@ -669,6 +679,8 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
     timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
+    if args.kaimm_gc_interval > 0:
+        gc.collect()
 
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
@@ -688,23 +700,34 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Tracking loss.
     total_loss_dict = {}
 
+    # Manual GC
+    if args.kaimm_gc_interval > 0:
+        gc.disable()
+        gc.collect()
+
     # Iterations.
     iteration = args.iteration
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
-    report_memory_flag = True
+    report_memory_flag = 2
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler)
+        if args.kaimm_gc_interval > 0:
+            if iteration % args.kaimm_gc_interval == 0:
+                gc.collect(0)
+        if args.kaimm_profile_analysis:
+            enable_perf_model()
+        with annotate_range(f"train_step rank_{torch.distributed.get_rank()} it_{iteration}"):
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                           train_data_iterator,
+                           model,
+                           optimizer,
+                           opt_param_scheduler)
         iteration += 1
-        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+        args.consumed_train_samples += mpu.get_data_parallel_for_sample_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
 
@@ -718,6 +741,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
+        if args.kaimm_profile_analysis:
+            perf_model_summary()
+            perf_model_clear()
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -774,6 +801,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()
 
+    if args.kaimm_gc_interval > 0:
+        gc.enable()
 
     return iteration
 
@@ -826,7 +855,7 @@ def evaluate(forward_step_func,
                         total_loss_dict[key] = total_loss_dict.get(
                             key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
-            args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
+            args.consumed_valid_samples += mpu.get_data_parallel_for_sample_world_size() \
                                            * args.micro_batch_size \
                                            * get_num_microbatches()
         collected_non_loss_data = None

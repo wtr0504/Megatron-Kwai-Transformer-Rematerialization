@@ -6,6 +6,7 @@ import torch
 
 from megatron import get_args
 from megatron.core import tensor_parallel
+from megatron.profile_utils import annotate_forward_backward
 from .module import MegatronModule
 
 from .enums import AttnMaskType
@@ -13,8 +14,10 @@ from .language_model import parallel_lm_logits
 from .language_model import get_language_model
 from .utils import init_method_normal
 from .utils import scaled_init_method_normal
+from .utils import slice_lm_inputs_along_cp, gather_post_lm_output_along_cp
 
 
+@annotate_forward_backward("post", "post")
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
                                    fp16_lm_cross_entropy):
@@ -82,6 +85,9 @@ class GPTModel(MegatronModule):
                 retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None):
 
+        input_ids, position_ids, attention_mask, labels = \
+            slice_lm_inputs_along_cp(input_ids, position_ids, attention_mask, labels)
+
         lm_output = self.language_model(
             input_ids,
             position_ids,
@@ -92,11 +98,11 @@ class GPTModel(MegatronModule):
             inference_params=inference_params)
 
         if self.post_process:
-            return post_language_model_processing(
+            return gather_post_lm_output_along_cp(post_language_model_processing(
                 lm_output, labels,
                 self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
                 self.parallel_output,
-                self.fp16_lm_cross_entropy)
+                self.fp16_lm_cross_entropy))
         else:
             return lm_output
 

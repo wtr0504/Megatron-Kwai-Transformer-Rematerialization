@@ -182,10 +182,19 @@ def _initialize_distributed():
         if mpu.model_parallel_is_initialized():
             print('model parallel is already initialized')
         else:
+            if(args.overlap_sp_ag or args.overlap_sp_rs):
+                torch.distributed.new_group(backend='mpi')
+                
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                            args.pipeline_model_parallel_size,
                                            args.virtual_pipeline_model_parallel_size,
-                                           args.pipeline_model_parallel_split_rank)
+                                           args.pipeline_model_parallel_split_rank,
+                                           context_parallel_size=args.context_parallel_size,
+                                           kaimm_cp_offload_mode=args.kaimm_cp_offload_mode,
+                                           kaimm_overlap_cp_slow_ctas=args.kaimm_overlap_cp_slow_ctas,
+                                           overlap_sp_ag=args.overlap_sp_ag, 
+                                           overlap_sp_rs=args.overlap_sp_rs)
+            
             if args.rank == 0:
                 print(f'> initialized tensor model parallel with size '
                       f'{mpu.get_tensor_model_parallel_world_size()}')
@@ -266,7 +275,7 @@ def _warmup_jit_function():
     # Warmup fused bias+gelu
     bias = torch.rand(args.ffn_hidden_size // args.tensor_model_parallel_size,
                       dtype=dtype, device='cuda')
-    input = torch.rand((args.seq_length, args.micro_batch_size,
+    input = torch.rand((args.seq_length // mpu.get_context_parallel_world_size(), args.micro_batch_size,
                         args.ffn_hidden_size // args.tensor_model_parallel_size),
                        dtype=dtype, device='cuda')
     # Warmup JIT fusions with the input grad_enable state of both forward
@@ -274,7 +283,9 @@ def _warmup_jit_function():
     for bias_grad, input_grad in zip([True, True], [False, True]):
         bias.requires_grad, input.requires_grad = bias_grad, input_grad
         for _ in range(5):
-            output = bias_gelu(bias, input)
+            output = None
+            if args.bias_gelu_fusion:
+                output = bias_gelu(bias, input)
     del bias, input, output
 
     # Warmup fused bias+dropout+add
@@ -282,6 +293,7 @@ def _warmup_jit_function():
         seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
         seq_length = args.seq_length
+    seq_length //= mpu.get_context_parallel_world_size()
     input = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
                        dtype=dtype, device='cuda')
     residual = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
@@ -295,6 +307,8 @@ def _warmup_jit_function():
         bias.requires_grad = bias_grad
         residual.requires_grad = residual_grad
         for _ in range(5):
-            output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
+            output = None
+            if args.bias_dropout_fusion:
+                output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
     del bias, input, residual, output
     torch.cuda.empty_cache()

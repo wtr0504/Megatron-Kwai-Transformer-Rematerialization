@@ -6,6 +6,9 @@ from typing import List, Sequence
 from megatron.core.utils import divide
 from megatron.core import parallel_state
 
+_cublas_workspace = None
+_ub_copy_stream = None
+
 def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
@@ -106,3 +109,26 @@ class VocabUtility:
         return VocabUtility.vocab_range_from_per_partition_vocab_size(
             per_partition_vocab_size, rank, world_size
         )
+
+
+def get_cublas_workspace_size_bytes() -> None:
+    """Return 32 MiB if using hopper, 4 MiB for all other architectures."""
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 9:
+        return 33_554_432
+    return 4_194_304
+
+
+def get_workspace() -> torch.Tensor:
+    """Returns workspace for cublas."""
+    global _cublas_workspace
+    if _cublas_workspace is None:
+        _cublas_workspace = torch.empty(
+            get_cublas_workspace_size_bytes(), dtype=torch.uint8, device="cuda"
+        )
+    return _cublas_workspace
+
+def get_ub_copy_stream():
+    global _ub_copy_stream
+    if _ub_copy_stream is None:
+        _ub_copy_stream = torch.cuda.Stream()
+    return _ub_copy_stream

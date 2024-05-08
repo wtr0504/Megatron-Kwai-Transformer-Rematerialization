@@ -361,6 +361,115 @@ def test_allmasked_softmax_backward():
             error = (back_grad - inputs.grad).abs().max()
             assert error < 1e-3
 
+def test_fast_rotary_pos_emb_inner(dtype: torch.dtype, slice_input: bool, sq_axis: int):
+    sq, b, np, hn = 2023, 6, 26, 1758
+    from megatron.model.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
+    device = "cuda"
+    if slice_input:
+        input_3x = torch.rand(sq, b, np, hn * 3, dtype=dtype, device=device)
+        input = input_3x[..., :hn]
+    else:
+        input = torch.rand(sq, b, np, hn, dtype=dtype, device=device)
+    input.requires_grad_()
+    if sq_axis == 0:
+        grad_output = torch.rand(input.shape, dtype=dtype, device=device)
+    elif sq_axis == 1:
+        grad_output_tr = torch.rand(input.shape[1], input.shape[0], input.shape[2], input.shape[3], dtype=dtype, device=device)
+        grad_output = grad_output_tr.permute(1, 0, 2, 3)
+    elif sq_axis == 2:
+        grad_output_tr = torch.rand(input.shape[1], input.shape[2], input.shape[0], input.shape[3], dtype=dtype, device=device)
+        grad_output = grad_output_tr.permute(2, 0, 1, 3)
+    else:
+        grad_output_tr = torch.rand(input.shape[1], input.shape[2], input.shape[3], input.shape[0], dtype=dtype, device=device)
+        grad_output = grad_output_tr.permute(3, 0, 1, 2)
+
+    rotary_pos_emb_ref = RotaryEmbedding(dim=hn).to(device).to(dtype)
+    freqs_ref = rotary_pos_emb_ref(sq)
+    output_ref = apply_rotary_pos_emb(input, freqs_ref)
+    output_ref.backward(grad_output)
+    d_input_ref = input.grad.clone()
+
+    input.grad.zero_()
+
+    rotary_pos_emb = RotaryEmbedding(dim=hn, use_fast_rope=True).to(device).to(dtype)
+    freqs = rotary_pos_emb(sq)
+    output = apply_rotary_pos_emb(input, freqs, use_fast_rope=True)
+    output.backward(grad_output)
+    d_input = input.grad.clone()
+
+    print(f"fast_rotary_pos_emb {dtype} slice_input={slice_input} sq_axis={sq_axis} forward diff max", (output - output_ref).abs().max().tolist(), "mean", (output - output_ref).abs().mean().tolist())
+    assert ((output - output_ref).abs() < 1e-4).all(), "forward error is too large"
+    print(f"fast_rotary_pos_emb {dtype} slice_input={slice_input} sq_axis={sq_axis} backward diff max", (d_input - d_input_ref).abs().max().tolist(), "mean", (d_input - d_input_ref).abs().mean().tolist())
+    assert ((d_input - d_input_ref).abs() < 1e-4).all(), "backward error is too large"
+
+
+def test_fast_rotary_pos_emb():
+    test_fast_rotary_pos_emb_inner(torch.bfloat16, False, 0)
+    test_fast_rotary_pos_emb_inner(torch.bfloat16, True, 1)
+    test_fast_rotary_pos_emb_inner(torch.bfloat16, True, 2)
+    test_fast_rotary_pos_emb_inner(torch.bfloat16, True, 3)
+    test_fast_rotary_pos_emb_inner(torch.float16, False, 0)
+    test_fast_rotary_pos_emb_inner(torch.float16, True, 1)
+    test_fast_rotary_pos_emb_inner(torch.float16, True, 2)
+    test_fast_rotary_pos_emb_inner(torch.float16, True, 3)
+    test_fast_rotary_pos_emb_inner(torch.float32, False, 0)
+    test_fast_rotary_pos_emb_inner(torch.float32, True, 1)
+    test_fast_rotary_pos_emb_inner(torch.float32, True, 2)
+    test_fast_rotary_pos_emb_inner(torch.float32, True, 3)
+
+
+def test_flip():
+    from megatron.core.context_parallel.dattention import flip_cp_, flip_cp, slice_cp
+    contiguous_tensor = torch.tensor([
+        0, 1, 2, 3,
+        4, 5, 6, 7,
+        8, 9, 10, 11,
+        12, 13, 14, 15,
+    ], device="cuda")
+    interleaved_tensor = torch.tensor([
+        0, 1, 14, 15,
+        4, 5, 10, 11,
+        8, 9, 6, 7,
+        12, 13, 2, 3,
+    ], device="cuda")
+    slice_tensor_rank1 = torch.tensor([
+        4, 5, 10, 11,
+    ], device="cuda")
+    x = contiguous_tensor.clone()
+    flip_cp_(x, dim=0, world_size=4)
+    assert (x == interleaved_tensor).all()
+    flip_cp_(x, dim=0, world_size=4)
+    assert (x == contiguous_tensor).all()
+    assert (flip_cp(contiguous_tensor, dim=0, world_size=4) == interleaved_tensor).all()
+    assert (flip_cp(interleaved_tensor, dim=0, world_size=4) == contiguous_tensor).all()
+    assert (slice_cp(contiguous_tensor, dim=0, world_size=4, rank=1) == slice_tensor_rank1).all()
+
+
+def test_addmm_inplace():
+    from megatron.fused_kernels.wrap_gemm_api import addmm_inplace
+    m, n, k = 2048, 3072, 3072
+    input = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+    mat1 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    mat2 = torch.randn(k, n, dtype=torch.bfloat16, device="cuda") / k ** .5
+    answer = torch.addmm(input, mat1, mat2)
+    output = addmm_inplace(input.clone(), mat1, mat2)
+    print(f"addmm_inplace diff max {(output - answer).abs().max()} diff mean {(output - answer).abs().mean()} answer max {answer.abs().max()}")
+    assert (output - answer).abs().max().item() < .01
+
+
+def test_fast_cat():
+    import fast_cat_cuda
+    x1 = torch.rand(131072, 3072, dtype=torch.bfloat16, device="cuda")
+    x2 = torch.rand(131072, 3072, dtype=torch.bfloat16, device="cuda")
+    x3 = torch.rand(131072, 3072, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty(x1.shape[0], 3 * x1.shape[1], dtype=torch.bfloat16, device="cuda")
+    for _ in range(10):
+        fast_cat_cuda.cat([x1.data_ptr(), x2.data_ptr(), x3.data_ptr()], output.data_ptr(),
+                          x1.shape[0], x1.shape[1] * x1.element_size(), torch.cuda.current_stream().cuda_stream)
+        answer = torch.cat([x1, x2, x3], dim=1)
+        answer.clone()
+    assert (output == answer).all()
+
 
 if __name__ == "__main__":
     try:
@@ -377,7 +486,12 @@ if __name__ == "__main__":
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
 
-    load()
+    class Args:
+        rank = 0
+        masked_softmax_fusion = True
+        use_fast_rope = True
+        context_parallel_size = 2
+    load(Args())
     test_masked_softmax_forward()
     test_masked_softmax_backward()
     test_allmasked_softmax_forward()
@@ -386,3 +500,7 @@ if __name__ == "__main__":
     test_fused_softmax()
     test_fused_upper_triangle_mask_softmax()
     test_layer_norm()
+    test_fast_rotary_pos_emb()
+    test_flip()
+    test_addmm_inplace()
+    test_fast_cat()

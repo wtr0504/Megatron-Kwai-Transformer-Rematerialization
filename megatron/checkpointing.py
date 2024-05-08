@@ -233,6 +233,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
         optimizer.save_parameter_state(optim_checkpoint_name)
+    else:
+        if any(isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap
+               for m in model for module in m.modules()):
+            raise NotImplementedError("fix qkv layout in non-distributed optimizer is not implemented")
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
@@ -243,6 +247,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
+        fix_query_key_value_ordering_inverse(model)
         if len(model) == 1:
             state_dict['model'] = model[0].state_dict_for_save_checkpoint()
         else:
@@ -266,6 +271,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         # Save.
         ensure_directory_exists(checkpoint_name)
         torch.save(state_dict, checkpoint_name)
+        fix_query_key_value_ordering(model, state_dict['checkpoint_version'])
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
@@ -353,6 +359,21 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                 param.data.copy_(fixed_param)
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
+
+    # Fix up query/key/value matrix ordering for cp_overlap
+    if not isinstance(model, list):
+        model = [model]
+    for m in model:
+        for module in m.modules():
+            if isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap:
+                module.convert_to_cp_overlap_weights()
+
+
+def fix_query_key_value_ordering_inverse(model):
+    for m in model:
+        for module in m.modules():
+            if isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap:
+                module.convert_from_cp_overlap_weights()
 
 
 def _load_base_checkpoint(load_dir, rank0=False):
@@ -478,7 +499,11 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('tokenizer_type')
-    _set_arg('padded_vocab_size')
+    _set_arg('tokenizer_model')
+    _set_arg('padded_vocab_size', force=True)
+    _set_arg('make_vocab_size_divisible_by', force=True)
+    _set_arg('rms_norm', force=True)
+    _set_arg('params_dtype')
     if checkpoint_version < 3.0:
         _set_arg('tensor_model_parallel_size',
                  'model_parallel_size')
@@ -577,6 +602,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                     get_distributed_optimizer_checkpoint_name(
                         model_checkpoint_name)
                 optimizer.load_parameter_state(optim_checkpoint_name)
+            else:
+                if any(isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap
+                       for m in model for module in m.modules()):
+                    raise NotImplementedError("fix qkv layout in non-distributed optimizer is not implemented")
 
             # Load scheduler.
             if opt_param_scheduler is not None:

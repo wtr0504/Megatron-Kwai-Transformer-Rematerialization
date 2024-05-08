@@ -2,10 +2,11 @@
 
 """Model and data parallel groups."""
 
+import os
 import torch
 from typing import Optional
 
-from .utils import GlobalMemoryBuffer
+from .utils import GlobalMemoryBuffer, GlobalTEUserBuffer
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -22,6 +23,19 @@ _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP_GLOO = None
 # FP8 amax reduction group.
 _AMAX_REDUCTION_GROUP = None
+
+# Context parallel
+#   DP groups collaborating on the same context (token sequence) are put into a context parallel group.
+#   Data parallel is the Cartesian product of the following factors:
+#   1. Data parallel for context, i.e. context parallel.
+#   2. Data parallel for sample.
+#   In the case of context parallel, be careful on the following matters:
+#   1. The dataloader should load contiguous tokens along the context parallel group.
+#   2. Attention is performed across the context parallel group.
+#   3. Loss and learning rate should be carefully scaled.
+_CONTEXT_PARALLEL_GROUP = None
+_CONTEXT_PARALLEL_GROUP_SLOW = None
+_CONTEXT_PARALLEL_GROUP_LOCAL = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
@@ -49,6 +63,14 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
+_GLOBAL_TE_USER_BUFFER = None
+def check_ctas_settings_are_effective():
+    assert not os.environ.get("NCCL_MIN_NRINGS"), "NCCL_MIN_NRINGS overrides torch.distributed.ProcessGroupNCCL.Options.min_ctas"
+    assert not os.environ.get("NCCL_MAX_NRINGS"), "NCCL_MAX_NRINGS overrides torch.distributed.ProcessGroupNCCL.Options.max_ctas"
+    assert not os.environ.get("NCCL_MIN_NCHANNELS"), "NCCL_MIN_CHANNELS overrides torch.distributed.ProcessGroupNCCL.Options.min_ctas"
+    assert not os.environ.get("NCCL_MAX_NCHANNELS"), "NCCL_MAX_NCHANNELS overrides torch.distributed.ProcessGroupNCCL.Options.max_ctas"
+    assert not os.environ.get("NCCL_MIN_CTAS"), "NCCL_MIN_CTAS overrides torch.distributed.ProcessGroupNCCL.Options.min_ctas"
+    assert not os.environ.get("NCCL_MAX_CTAS"), "NCCL_MAX_CTAS overrides torch.distributed.ProcessGroupNCCL.Options.max_ctas"
 
 
 def initialize_model_parallel(
@@ -57,6 +79,12 @@ def initialize_model_parallel(
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_fp8: bool = False,
+    *,
+    context_parallel_size: int = 1,
+    kaimm_cp_offload_mode = None,
+    kaimm_overlap_cp_slow_ctas = None,
+    overlap_sp_ag = False,
+    overlap_sp_rs = False
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -130,6 +158,7 @@ def initialize_model_parallel(
 
     data_parallel_size: int = world_size // (tensor_model_parallel_size *
                                              pipeline_model_parallel_size)
+    assert data_parallel_size % context_parallel_size == 0, f"{data_parallel_size} % {context_parallel_size} != 0"
 
     num_tensor_model_parallel_groups: int  = world_size // tensor_model_parallel_size
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -155,6 +184,10 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+    global _CONTEXT_PARALLEL_GROUP
+    global _CONTEXT_PARALLEL_GROUP_SLOW
+    global _CONTEXT_PARALLEL_GROUP_LOCAL
+    assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     all_data_parallel_group_ranks = []
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
@@ -168,6 +201,42 @@ def initialize_model_parallel(
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
+            for k in range(data_parallel_size // context_parallel_size):
+                ranks = range(
+                    start_rank + j + k * (tensor_model_parallel_size * context_parallel_size),
+                    start_rank + j + (k + 1) * (tensor_model_parallel_size * context_parallel_size),
+                    tensor_model_parallel_size,
+                )
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _CONTEXT_PARALLEL_GROUP = group
+                if context_parallel_size >= 2:
+                    assert kaimm_cp_offload_mode in [0, 1, 2]
+                    if kaimm_cp_offload_mode == 0:
+                        check_ctas_settings_are_effective()
+                        opt_slow = torch.distributed.ProcessGroupNCCL.Options()
+                        if kaimm_overlap_cp_slow_ctas is not None:
+                            opt_slow.config.min_ctas = opt_slow.config.max_ctas = kaimm_overlap_cp_slow_ctas
+                        group_slow = torch.distributed.new_group(ranks, pg_options=opt_slow)
+                        if rank in ranks:
+                            _CONTEXT_PARALLEL_GROUP_SLOW = group_slow
+                    else:
+                        if kaimm_cp_offload_mode == 1:
+                            local_device_count = min(torch.cuda.device_count(), tensor_model_parallel_size)
+                        else:
+                            local_device_count = torch.cuda.device_count()
+                        local_start_idx = 0
+                        while local_start_idx < len(ranks):
+                            local_end_idx = local_start_idx + 1
+                            while local_end_idx < len(ranks) and \
+                                    ranks[local_start_idx] // local_device_count == \
+                                    ranks[local_end_idx] // local_device_count:
+                                local_end_idx += 1
+                            ranks_local = ranks[local_start_idx:local_end_idx]
+                            group_local = torch.distributed.new_group(ranks_local)
+                            if rank in ranks_local:
+                                _CONTEXT_PARALLEL_GROUP_LOCAL = group_local
+                            local_start_idx = local_end_idx
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -258,6 +327,8 @@ def initialize_model_parallel(
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
+    if(overlap_sp_ag or overlap_sp_rs):
+        _set_global_te_user_buffer()
 
 
 def is_unitialized():
@@ -293,6 +364,27 @@ def get_pipeline_model_parallel_group():
     assert _PIPELINE_MODEL_PARALLEL_GROUP is not None, \
         'pipeline_model parallel group is not initialized'
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_context_parallel_group():
+    """Get the context parallel group the caller rank belongs to."""
+    assert _CONTEXT_PARALLEL_GROUP is not None, \
+        'context parallel group is not initialized'
+    return _CONTEXT_PARALLEL_GROUP
+
+
+def get_context_parallel_group_slow():
+    """Get the context parallel group-slow the caller rank belongs to."""
+    assert _CONTEXT_PARALLEL_GROUP_SLOW is not None, \
+        'context parallel group-slow is not initialized'
+    return _CONTEXT_PARALLEL_GROUP_SLOW
+
+
+def get_context_parallel_group_local():
+    """Get the context parallel group-local the caller rank belongs to."""
+    assert _CONTEXT_PARALLEL_GROUP_LOCAL is not None, \
+        'context parallel group-local is not initialized'
+    return _CONTEXT_PARALLEL_GROUP_LOCAL
 
 
 def get_data_parallel_group():
@@ -362,6 +454,11 @@ def get_pipeline_model_parallel_world_size():
     return torch.distributed.get_world_size(group=get_pipeline_model_parallel_group())
 
 
+def get_context_parallel_world_size():
+    """Return world size for the context parallel group."""
+    return torch.distributed.get_world_size(group=get_context_parallel_group())
+
+
 def set_tensor_model_parallel_rank(rank):
     """Set tensor model parallel rank."""
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
@@ -400,6 +497,11 @@ def get_pipeline_model_parallel_split_rank():
     """Return pipeline model parallel split rank."""
     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+
+
+def get_context_parallel_rank():
+    """Return my rank for the context parallel group."""
+    return torch.distributed.get_rank(group=get_context_parallel_group())
 
 
 def is_pipeline_first_stage(ignore_virtual=False):
@@ -569,6 +671,15 @@ def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return torch.distributed.get_rank(group=get_data_parallel_group())
 
+
+def get_data_parallel_for_sample_world_size():
+    return get_data_parallel_world_size() // get_context_parallel_world_size()
+
+
+def get_data_parallel_for_sample_rank():
+    return get_data_parallel_rank() // get_context_parallel_world_size()
+
+
 def _set_global_memory_buffer():
     """Initialize global buffer"""
     global _GLOBAL_MEMORY_BUFFER
@@ -580,6 +691,19 @@ def get_global_memory_buffer():
     assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
     return _GLOBAL_MEMORY_BUFFER
 
+def _set_global_te_user_buffer():
+    """Initialize global TE userbuffer"""
+    global _GLOBAL_TE_USER_BUFFER
+    assert _GLOBAL_TE_USER_BUFFER is None, 'global TE userbuffer is already initialized'
+    _GLOBAL_TE_USER_BUFFER = GlobalTEUserBuffer()
+
+def get_global_te_user_buffer(name, shape, dtype, ag):
+    """Return the GlobalBuffer object"""
+    assert _GLOBAL_TE_USER_BUFFER is not None, 'global TE userbuffer is not initialized'
+    rank = torch.distributed.get_rank()
+    tp_world_size = get_tensor_model_parallel_world_size()
+    return _GLOBAL_TE_USER_BUFFER.get_ub(name, shape, dtype, 
+                                         tp_world_size, rank, ag)
 
 def destroy_model_parallel():
     """Set the groups to none."""
@@ -589,6 +713,10 @@ def destroy_model_parallel():
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+    global _CONTEXT_PARALLEL_GROUP
+    _CONTEXT_PARALLEL_GROUP = None
+    global _CONTEXT_PARALLEL_GROUP_SLOW
+    _CONTEXT_PARALLEL_GROUP_SLOW = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
     global _EMBEDDING_GROUP
@@ -611,3 +739,5 @@ def destroy_model_parallel():
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+    global _GLOBAL_TE_USER_BUFFER
+    _GLOBAL_TE_USER_BUFFER = None

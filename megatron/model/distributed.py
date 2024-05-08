@@ -204,7 +204,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # If we have buffers, simply reduce the data in the buffer.
         if self._grad_buffers is not None:
             for _, buffer_ in self._grad_buffers.items():
-                buffer_.data /= mpu.get_data_parallel_world_size()
+                buffer_.data /= mpu.get_data_parallel_world_size() // mpu.get_context_parallel_world_size()
                 torch.distributed.all_reduce(
                     buffer_.data, group=mpu.get_data_parallel_group())
         else:
@@ -224,7 +224,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 bucket = buckets[tp]
                 grads = [param.grad.data for param in bucket]
                 coalesced = _flatten_dense_tensors(grads)
-                coalesced /= mpu.get_data_parallel_world_size()
+                coalesced /= mpu.get_data_parallel_world_size() // mpu.get_context_parallel_world_size()
                 torch.distributed.all_reduce(
                     coalesced, group=mpu.get_data_parallel_group())
                 for buf, synced in zip(grads, _unflatten_dense_tensors(

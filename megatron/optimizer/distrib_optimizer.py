@@ -16,6 +16,14 @@ from megatron.model.module import param_is_not_shared
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
 
+def up_div(a, b):
+    return (a + b - 1) // b
+
+
+def round_up(x, base):
+    return (x + base - 1) // base * base
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -29,6 +37,8 @@ class Range:
         return Range(start, start + self.size)
     def __str__(self):
         return "%d,%d [%d]" % (self.start, self.end, self.size)
+    def __repr__(self):
+        return "<Range object %s>" % str(self)
     def __len__(self):
         return self.end - self.start
 
@@ -415,10 +425,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # Typed param buffer.
                 param_buffer = torch.tensor(
-                    storage,
+                    storage if params_dtype == grad_buffer.data.dtype else storage[:storage.nbytes()//2],
                     dtype = params_dtype,
                     device = grad_buffer.data.device)
-                param_buffer = param_buffer[:grad_buffer.numel_padded]
                 current_param_buffers[dtype] = param_buffer
             self.param_buffers.append(current_param_buffers)
 
@@ -652,6 +661,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if data_parallel_rank == 0:
                         world_tensors[key] = torch.cat(recv_tensors)
 
+                        for module in model.modules():
+                            if isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap:
+                                param = module.weight
+                                hidden_size_per_attention_head = module.hidden_size_per_attention_head
+                                param_world_start, param_world_end = model._grad_buffer_param_index_map[dtype][param]
+                                world_tensor = world_tensors[key]
+                                world_tensor_slice = world_tensor[param_world_start:param_world_end]
+                                world_tensor_slice.copy_(world_tensor_slice.clone()
+                                                         .view(3, -1, hidden_size_per_attention_head, param.shape[1])
+                                                         .transpose(0, 1).reshape(-1))
+
                 # Collect world state.
                 dtype_state[dtype] = world_tensors
             state[model_idx] = dtype_state
@@ -698,6 +718,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                                 device="cpu")
                                 for key in ("param", "exp_avg", "exp_avg_sq")}
 
+                if data_parallel_rank == 0:
+                    for module in model.modules():
+                        if isinstance(module, tensor_parallel.ColumnParallelLinear) and module.cp_overlap:
+                            param = module.weight
+                            hidden_size_per_attention_head = module.hidden_size_per_attention_head
+                            param_world_start, param_world_end = model._grad_buffer_param_index_map[dtype][param]
+                            for key in local_shards:
+                                world_tensor = loaded_state[model_idx][dtype][key]
+                                world_tensor_slice = world_tensor[param_world_start:param_world_end]
+                                world_tensor_slice.copy_(world_tensor_slice.clone()
+                                                         .view(-1, 3,hidden_size_per_attention_head, param.shape[1])
+                                                         .transpose(0, 1).reshape(-1))
+
                 # Scatter local shards from DP rank 0.
                 for key, recv_tensor in local_shards.items():
                     
@@ -707,7 +740,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         gbuf_start_idxs = \
                             list(range(0, gbuf_world_numel, gbuf_local_numel))
                         send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
-                                        for i in gbuf_start_idxs]
+                                        for i in gbuf_start_idxs[:-1]]
+                        # check for numel padding tensor in last DP rank
+                        diff = gbuf_local_numel - (world_tensor.shape[-1] - gbuf_start_idxs[-1])
+                        last_idx = gbuf_start_idxs[-1]
+                        if diff > 0:
+                            padding_tensor = torch.empty((diff,), device=world_tensor.device, dtype=world_tensor.dtype)
+                            send_tensors.append(torch.cat([world_tensor[last_idx:], padding_tensor], dim=-1))
+                        elif diff < 0:
+                            send_tensors.append(world_tensor[last_idx: last_idx + gbuf_local_numel])
+                        else:
+                            send_tensors.append(world_tensor[last_idx:])
                     else:
                         send_tensors = None
 
@@ -789,8 +832,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 assert buf.numel() % data_parallel_world_size == 0
                 shard_size = int(buf.numel() / data_parallel_world_size)
-                buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
-                             for r in range(data_parallel_world_size)]
+                buf_views = buf.view(data_parallel_world_size, shard_size)
                 view_items.append((model_index, dtype, buf, buf_views))
 
         return view_items
@@ -837,11 +879,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
         data_parallel_group = mpu.get_data_parallel_group()
+        context_parallel_world_size = mpu.get_context_parallel_world_size()
 
         # Scale grad buffers by '1 / data_parallel_world_size'.
         for model in self.models:
             for dtype, gbuf in model._grad_buffers.items():
-                gbuf.data /= data_parallel_world_size
+                gbuf.data /= data_parallel_world_size // context_parallel_world_size
 
         # Reduce-scatter all grads.
         gbuf_view_items = self.get_model_grad_buffer_dp_views()

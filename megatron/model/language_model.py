@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.profile_utils import annotate_forward_backward
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -191,6 +192,7 @@ class Embedding(MegatronModule):
 
         self.fp32_residual_connection = args.fp32_residual_connection
         self.sequence_parallel = args.sequence_parallel
+        self.clone_scatter_output_in_embedding = args.clone_scatter_output_in_embedding
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
@@ -222,6 +224,7 @@ class Embedding(MegatronModule):
         args = get_args()
         self.init_method(self.tokentype_embeddings.weight)
 
+    @annotate_forward_backward("emb", "emb")
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
         if self.embedding_weights_in_fp32:
@@ -252,6 +255,11 @@ class Embedding(MegatronModule):
         # Dropout.
         if self.sequence_parallel:
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # `scatter_to_sequence_parallel_region` returns a view, which prevents
+            # the original tensor from being garbage collected. Clone to facilitate GC.
+            # Has a small runtime cost (~0.5%).
+            if self.clone_scatter_output_in_embedding:
+                embeddings = embeddings.clone()
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
@@ -392,7 +400,9 @@ class TransformerLanguageModel(MegatronModule):
             # partial rotary embeddings, which is better than full rotary
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, args.use_fast_rope,
+                                                  mpu.get_context_parallel_world_size(),
+                                                  mpu.get_context_parallel_rank())
 
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).

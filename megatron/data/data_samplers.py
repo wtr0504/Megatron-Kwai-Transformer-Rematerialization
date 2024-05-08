@@ -24,26 +24,28 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+            data_parallel_rank=mpu.get_data_parallel_for_sample_rank(),
+            data_parallel_size=mpu.get_data_parallel_for_sample_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=mpu.get_data_parallel_for_sample_rank(),
+            data_parallel_size=mpu.get_data_parallel_for_sample_world_size(),
             data_sharding=args.data_sharding)
     else:
         raise Exception('{} dataloader type is not supported.'.format(
                 args.dataloader_type))
 
     # Torch dataloader.
+    # Notice: here will use default collate_fn, see: torch/utils/data/_utils/collate.py
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
-                                       pin_memory=True)
+                                       pin_memory=True,
+                                       prefetch_factor=args.prefetch_factor)
 
 class MegatronPretrainingSampler:
 
