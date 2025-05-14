@@ -1,3 +1,47 @@
+# My Work
+this respository is forked from Megatron-Kwai. My job is modifing transformer block and transformer layer. Now we can selectively recompute FFN layer， offload the input of transformer layer and offload attention activation such as q、k、v and flash attn output. Between Transformer layers, we implemented prefetch two layers in advance when backward. And we can choose offloading every other layer when the PCI bandwidth is limited. The strategy is combining the ideas of papers [MeMo](https://arxiv.org/abs/2407.12117) and [ByteScale](https://arxiv.org/abs/2502.21231). I would like to thank my mentor for his guidance.
+
+The main optimization is in [Transformer layer and block](https://github.com/wtr0504/Megatron-Kwai-Transformer-Rematerialization/blob/main/megatron/model/transformer.py) and [offload logic](https://github.com/wtr0504/Megatron-Kwai-Transformer-Rematerialization/blob/main/megatron/model/transformer_offload.py)
+
+## Test results
+The expected performance is listed as follows.
+
+
+```bash
+cd ~/Megatron-Kwai/examples/atc24
+./0_my_run_7b_1gpu_transformer_offload_recompute_baseline.sh
+```
+
+
+| Strategy | elapsed time per iteration(ms) | tokens per sec per gpu| cuda memory allocated(GiB) |
+|--|--|--|--|
+| offload every layer(ours) | 34721.1 | 7549 | 45.3G |
+| offload every other layer(ours) | 34867.4 | 7518 | 47.8G|
+| no checkpoint | 34721.9 | 7549 | 66.8G |
+| selective recompute | 34859.4 | 7520 | 49.8G |
+| full recompute | 43958.2 | 5963 | 35.8G |
+
+#### offload every layer attention activation(ours)
+max cuda memory allocated 45.3G
+<img src="examples/atc24/ours_log/mem_prof_img/img/ours_all_layers_offload.png" width="80%"> 
+
+#### offload every other layer(ours)
+max cuda memory allocated 47.8G
+<img src="examples/atc24/ours_log/mem_prof_img/img/ours_offload_one_separated_one_layer.png" width="80%">
+
+#### no checkpoint
+max cuda memory allocated 66.8G
+<img src="examples/atc24/ours_log/mem_prof_img/img/no_recompute_and_no_offload.png" width="80%">
+
+#### selective recompute
+max cuda memory allocated 49.8G
+<img src="examples/atc24/ours_log/mem_prof_img/img/selective_recompute_no_offload.png" width="80%">
+
+#### full recompute
+max cuda memory allocated 35.8G
+<img src="examples/atc24/ours_log/mem_prof_img/img/full_recompute.png" width="80%"> 
+
+
 # Artifact Evaluation for USENIX ATC '24
 
 This directory contains scripts used to reproduce the results in "*Accelerating the Training of Large Language Models using Efficient Activation Rematerialization and Optimal Hybrid Parallelism*" that is to appear at USENIX ATC '24. These scripts use OpenMPI, but can be modified for other schedulers as well.
@@ -11,7 +55,7 @@ This directory contains scripts used to reproduce the results in "*Accelerating 
 
 ```bash
 git clone https://github.com/kwai/Megatron-Kwai.git --branch atc24ae ~/Megatron-Kwai
-```
+```  
 
 The referred "Latest Megatron-LM" is the snapshot of NVIDIA/Megatron-LM at Jan 1, 2024, when the commit id was [2bc6cd3](https://github.com/NVIDIA/Megatron-LM/commit/2bc6cd307a11423928c675f741e79e03df23e721). We make minor modifications (&#126;10 lines) on it to ensure compatibility with OpenMPI and for our dataset.
 
