@@ -7,7 +7,7 @@ import torch
 from collections import defaultdict
 from megatron import get_args
 from megatron.core.context_parallel.offload import set_ideal_affinity_for_current_gpu
-
+import time
 
 _MEMCPY_STREAM = dict()
 _GPU_BUFFER_POOL = dict()
@@ -81,7 +81,7 @@ class TensorWrap:
         self.device = x.device
         self.base = None
 
-
+from megatron.core import parallel_state
 class TensorPack:
     def __init__(self, tensor_wrap):
         self.tensor_wrap = tensor_wrap
@@ -166,7 +166,6 @@ class ActivationGroup:
                         self.buffer_cpu[begin_idx:end_idx].view(x.dtype).view(x.shape).copy_(x, non_blocking=True)
                     else:
                         copy2d_(self.buffer_cpu[begin_idx:end_idx].view(x.dtype).view(x.shape), x)
-
         return stream, buffer, copy_tasks
 
     def offload_epilogue(self, stream, buffer, copy_tasks):
@@ -189,8 +188,11 @@ class ActivationGroup:
         buffer = get_persistent_gpu_buffer(buffer_key, self.buffer_cpu.numel())
         assert buffer._base.ref_cnt == 0, "last onload tensors are not fully deleted"
         stream.wait_stream(torch.cuda.current_stream())
+        start = time.time()
+        print(f"onload size {buffer.numel() / 1024 / 1024} MiB")
         with torch.cuda.stream(stream):
             buffer.copy_(self.buffer_cpu, non_blocking=True)
+        print(f"onload_prologue time {(time.time() - start) * 1000} ms")
         return stream, buffer, ping_pong_onload
 
     def onload_epilogue(self, stream, buffer, ping_pong_onload):
@@ -267,6 +269,8 @@ def record(key):
 
     def unpack_hook(tensor_pack):
         x = tensor_pack.get()
+        if x == None:
+            raise RuntimeError("unpack tensor is None")
         return x
 
     with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
@@ -278,17 +282,25 @@ def record(key):
 @contextlib.contextmanager
 def offload_async(key):
     group = groups[key]
+    # start = time.time()
     args = group.offload_prologue(use_bucket=False)
+    # print(f"offload_prologue time {(time.time() - start) * 1000} s")
     yield
+    # start = time.time()
     group.offload_epilogue(*args)
+    # print(f"offload_epilogue time {(time.time() - start) * 1000} s")
 
 
 @contextlib.contextmanager
 def onload_async(key):
     group = groups[key]
+    # start = time.time()
     args = group.onload_prologue(overlap_d2h_h2d=True, ping_pong_onload=True)
+    # print(f"onload_prologue time {(time.time() - start) * 1000} s")
     yield
+    # start = time.time()
     group.onload_epilogue(*args)
+    # print(f"onload_epilogue time {(time.time() - start) * 1000} s")
 
 
 def get_forward_tensor_and_backward_handle(x):

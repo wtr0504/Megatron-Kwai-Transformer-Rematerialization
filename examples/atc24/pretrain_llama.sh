@@ -24,7 +24,7 @@ fi
 TP_OVERLAP_ARGS="--overlap-sp-ag --overlap-sp-rs"
 
 GPT_ARGS="
-    --num-layers $NUM_LAYERS \
+    --num-layers 14 \
     --hidden-size $HIDDEN_SIZE \
     --num-attention-heads $NUM_ATTENTION_HEADS \
     --ffn-hidden-size $FFN_HIDDEN_SIZE \
@@ -73,6 +73,11 @@ OUTPUT_ARGS="
     --eval-iters 0
 "
 
+TRANSFORMER_OFFLOAD_ARGS=(
+    # --selective-recompute-offload-transformer-layer
+    # --recompute-ffn
+)
+
 if [ -n "${HOSTFILE:-}" ]; then
     CLUSTER_MPI_ARGS="
         --hostfile $HOSTFILE \
@@ -107,7 +112,7 @@ mpirun --allow-run-as-root \
         -x NVTE_BWD_LAYERNORM_SM_MARGIN=8 \
         -x TORCH_NCCL_AVOID_RECORD_STREAMS=1 \
         -x PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:21 \
-        -x MASTER_ADDR=$MASTER_ADDR -x MASTER_PORT=6002 \
+        -x MASTER_ADDR=$MASTER_ADDR -x MASTER_PORT=6003 \
     python3 ../../pretrain_gpt.py \
     --use-distributed-optimizer \
     --accumulate-allreduce-grads-in-fp32 \
@@ -116,8 +121,6 @@ mpirun --allow-run-as-root \
     --tensor-model-parallel-size $TP \
     --sequence-parallel \
     --pipeline-model-parallel-size $PP \
-    --num-layers-per-virtual-pipeline-stage $PP_l \
-    --overlap-p2p-communication \
     --context-parallel-size $CP \
     $CKPT_ARGS \
     $TP_OVERLAP_ARGS \
@@ -128,8 +131,10 @@ mpirun --allow-run-as-root \
     --use-fast-rope \
     --kaimm-offload-activation-ratio $OFFLOAD_ALPHA \
     --kaimm-async-dataloader \
+    ${TRANSFORMER_OFFLOAD_ARGS[@]} \
     --prefetch-factor 64 \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
-    2>&1 | tee logs/llama_$TS.txt
+    2>&1 | tee logs/llama_$TS.txt \
+

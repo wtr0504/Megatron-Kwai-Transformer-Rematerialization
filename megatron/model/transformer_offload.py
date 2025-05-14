@@ -26,19 +26,19 @@ total_size.append(0.0)
 gpu_buffer_lock = threading.Lock()
 
 
-def get_gpu_buffer(key, size):
+def get_gpu_buffer(key, cpu_buffer_like):
     """Get a buffer for GPU."""
     with gpu_buffer_lock:
-        if key not in _GPU_BUFFER_POOL or _GPU_BUFFER_POOL[key].numel() < size:
+        if key not in _GPU_BUFFER_POOL or _GPU_BUFFER_POOL[key].numel() < cpu_buffer_like.numel():
             _GPU_BUFFER_POOL[key] = None
-            _GPU_BUFFER_POOL[key] = torch.empty(size, dtype=torch.uint8, device="cuda")
+            _GPU_BUFFER_POOL[key] = torch.empty_like(cpu_buffer_like,device="cuda")
             _GPU_BUFFER_POOL[key].ref_cnt = 0  # ref_cnt supports ping_pong onload
-            total_size[0] += size
+            total_size[0] += cpu_buffer_like.numel() * cpu_buffer_like.element_size()
             if parallel_state.get_pipeline_model_parallel_rank() == 0:
                 print(
                     f"rank {parallel_state.get_pipeline_model_parallel_rank()} allocated gpu mem size {total_size[0]/1024/1024} Mib"
                 )
-        return _GPU_BUFFER_POOL[key][:size]
+        return _GPU_BUFFER_POOL[key][:cpu_buffer_like.numel()]
 
 
 cpu_buffer_lock = threading.Lock()
@@ -56,7 +56,7 @@ def get_cpu_buffer(size):
             return _CPU_BUFFER_POOL.pop(best_idx)[:size]
         if _CPU_BUFFER_POOL:
             _CPU_BUFFER_POOL.pop()
-        buffer = torch.empty(size, dtype=torch.int8, device="cpu")
+        buffer = torch.empty(size, dtype=torch.int8, device="cpu",pin_memory=True)
         return buffer[:size]
 
 
@@ -100,9 +100,8 @@ class ActivationGroup:
         args = get_args()
         self.tensors = [tensor for tensor in tensors if tensor.x is not None]
         self.tensors = sorted(self.tensors, key=lambda t: (not t.x.is_contiguous(), -t.shape.numel()))
-        self.offload_ratio = 1.0
-        self.offload_size = 1000 * 10 * (2**20)  # bytes
         # if self.offload_ratio > .5:
+        # print(f"offload tensors count {len(self.tensors)}")
         #     self.tensors = self.tensors[::-1]
 
     def offload_prologue(self, use_bucket):
@@ -131,11 +130,10 @@ class ActivationGroup:
                 n = tensor.shape.numel() * tensor.dtype.itemsize
                 self.tensor_to_buffer_map.append((top, top + n, is_duplicate))
                 top += n
-            if top > self.offload_size:
-                break
+
 
         MiB = 2**20
-        offload_size = min((int(math.ceil(top * self.offload_ratio)) + MiB - 1) // MiB * MiB, self.offload_size)
+        offload_size = (int(math.ceil(top)) + MiB - 1) // MiB * MiB
 
         if use_bucket:
             buffer = get_gpu_buffer("offload", offload_size)
@@ -196,21 +194,25 @@ class ActivationGroup:
         stream_key = "onload" if overlap_d2h_h2d else "offload"
         if ping_pong_onload:
             buffer_key = "onload_ping"
-            buffer = get_gpu_buffer(buffer_key, self.cpu_buffer.numel())
+            buffer = get_gpu_buffer(buffer_key, self.cpu_buffer)
             if buffer._base.ref_cnt > 0:
                 buffer_key = "onload_pong"
-            buffer = get_gpu_buffer(buffer_key, self.cpu_buffer.numel())
+            buffer = get_gpu_buffer(buffer_key, self.cpu_buffer)
             if buffer._base.ref_cnt > 0:
                 buffer_key = "onload_three"
-                buffer = get_gpu_buffer(buffer_key, self.cpu_buffer.numel())
+                buffer = get_gpu_buffer(buffer_key, self.cpu_buffer)
         else:
             buffer_key = stream_key
         stream = get_memcpy_stream(stream_key)
-        buffer = get_gpu_buffer(buffer_key, self.cpu_buffer.numel())
+        buffer = get_gpu_buffer(buffer_key, self.cpu_buffer)
         assert buffer._base.ref_cnt == 0, "last onload tensors are not fully deleted"
         stream.wait_stream(torch.cuda.current_stream())
+        # start = time.time()
         with torch.cuda.stream(stream):
             buffer.copy_(self.cpu_buffer, non_blocking=True)
+        # print(
+        #     f"copy cpu buffer to gpu buffer time {(time.time() - start) * 1000} ms"
+        # )
         return stream, buffer, ping_pong_onload
 
     def onload_epilogue(self, stream, buffer, ping_pong_onload):
@@ -291,6 +293,7 @@ def record(key):
 
         if not is_parameter and not is_too_small and not is_rope_freqs and (is_attention_activation ):
             # or is_rmsnorm
+            
             # print(f"offload x address {hex(x.data_ptr())} shape {x.shape} grad_fn {x.grad_fn}")
 
             # if type(x.grad_fn).__name__ == "FusedLayerNormAffineFunctionBackward":
@@ -334,12 +337,13 @@ def onload_async(key):
     def prologue_thread():
         # torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         args_container.append(group.onload_prologue(overlap_d2h_h2d=True, ping_pong_onload=True))
-        group.onload_epilogue(*args_container[0])
 
     thread = threading.Thread(target=prologue_thread)
     thread.start()
     yield
     thread.join()
+    group.onload_epilogue(*args_container[0])
+
     
 
 

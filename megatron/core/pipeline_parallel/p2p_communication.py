@@ -361,7 +361,7 @@ def _communicate(*, tensor_send_next: Optional[torch.Tensor],
 
 def recv_forward(tensor_shape: Shape,
                  dtype: torch.dtype,
-                 batch_p2p_comm: bool = True,
+                 batch_p2p_comm: bool = False,
                  timers: Callable = None) -> torch.Tensor:
     """ Receive tensor from previous rank in pipeline (forward receive).
 
@@ -389,7 +389,7 @@ def recv_forward(tensor_shape: Shape,
 
 def recv_backward(tensor_shape: Shape,
                   dtype: torch.dtype,
-                  batch_p2p_comm: bool = True,
+                  batch_p2p_comm: bool = False,
                   timers: Callable = None) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
@@ -414,7 +414,7 @@ def recv_backward(tensor_shape: Shape,
 
 
 def send_forward(output_tensor: torch.Tensor,
-                 batch_p2p_comm: bool = True,
+                 batch_p2p_comm: bool = False,
                  timers: Callable = None) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
@@ -437,7 +437,7 @@ def send_forward(output_tensor: torch.Tensor,
 
 
 def send_backward(input_tensor_grad: torch.Tensor,
-                  batch_p2p_comm: bool = True,
+                  batch_p2p_comm: bool = False,
                   timers: Callable = None) -> None:
     """Send tensor to previous rank in pipeline (backward send).
 
@@ -461,7 +461,7 @@ def send_backward(input_tensor_grad: torch.Tensor,
 def send_forward_recv_backward(output_tensor: torch.Tensor,
                                tensor_shape: Shape,
                                dtype: torch.dtype,
-                               batch_p2p_comm: bool = True,
+                               batch_p2p_comm: bool = False,
                                timers: Callable = None) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
@@ -488,7 +488,7 @@ def send_forward_recv_backward(output_tensor: torch.Tensor,
 def send_backward_recv_forward(input_tensor_grad: torch.Tensor,
                                tensor_shape: Shape,
                                dtype: torch.dtype,
-                               batch_p2p_comm: bool = True,
+                               batch_p2p_comm: bool = False,
                                timers: Callable = None) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 

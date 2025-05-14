@@ -758,6 +758,12 @@ def _add_training_args(parser):
                        'whole transformer layer is recomputed, '
                        '2) selective: core attention part of the transformer '
                        'layer is recomputed.')
+    
+    group.add_argument('--recompute-ffn', action='store_true',
+                       help='Recompute FFN activations to save memory')
+    group.add_argument('--selective-recompute-offload-transformer-layer', action='store_true',
+                       help='Recompute MLP activations to save memory')
+    
     group.add_argument('--kaimm-recompute-mlp-activation-func', action='store_true',
                        help='Recompute activation between parallel MLP linears')
     group.add_argument('--kaimm-recompute-norm', action='store_true',

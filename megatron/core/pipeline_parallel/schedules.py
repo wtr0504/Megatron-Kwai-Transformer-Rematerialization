@@ -12,7 +12,7 @@ from megatron.core.pipeline_parallel import offload, p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import cuda_sync_and_record, get_attr_wrapped_model, get_model_type
 from megatron.profile_utils import annotate_forward_range, annotate_backward_range
-
+import time
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -130,6 +130,7 @@ def get_forward_backward_func():
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
+            print("use forward_backward_pipelining_without_interleaving")
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = forward_backward_no_pipelining
@@ -1130,6 +1131,11 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, dtype, timers)
     return input_tensors
 
 
+offload_enter_total_time = [0]
+offload_exit_total_time = [0]
+onload_enter_time = [0]
+onload_exit_time = [0]
+
 def forward_backward_pipelining_without_interleaving(*,
                                                      forward_step_func,
                                                      data_iterator: Union[Iterator, List[Iterator]],
@@ -1230,12 +1236,17 @@ def forward_backward_pipelining_without_interleaving(*,
             output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                          input_tensor, forward_data_store,
                                          timers, collect_non_loss_data, dtype, enable_autocast)
+        torch.cuda.memory._dump_snapshot(f"log/kwai_bucket_rank{parallel_state.get_pipeline_model_parallel_rank()}_ratio_10_warmup_after_forward.pickle")
 
         if num_warmup_microbatches >= 2:
             if i > 0:
+                start = time.time()
                 offload_ctx.__exit__(None, None, None)
+                offload_exit_total_time[0] += time.time() - start
             offload_ctx = offload.offload_async(i)
+            start = time.time()
             offload_ctx.__enter__()
+            offload_enter_total_time[0] += time.time() - start
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
         if not forward_only:
@@ -1245,7 +1256,9 @@ def forward_backward_pipelining_without_interleaving(*,
 
     if num_warmup_microbatches >= 2:
         onload_ctx = offload.onload_async(0)
+        start = time.time()
         onload_ctx.__enter__()
+        onload_enter_time[0] += time.time() - start
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -1276,12 +1289,20 @@ def forward_backward_pipelining_without_interleaving(*,
                                            timers=timers)
 
             if num_warmup_microbatches >= 2:
+                start = time.time()
                 onload_ctx.__exit__(None, None, None)
+                onload_exit_time[0] += time.time() - start
+                start = time.time()
                 offload_ctx.__exit__(None, None, None)
+                offload_exit_total_time[0] += time.time() - start
                 offload_ctx = offload.offload_async(forward_id)
                 onload_ctx = offload.onload_async(i + 1)
+                start = time.time()
                 offload_ctx.__enter__()
+                offload_enter_total_time[0] += time.time() - start
+                start = time.time()
                 onload_ctx.__enter__()
+                onload_enter_time[0] += time.time() - start
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
@@ -1329,10 +1350,14 @@ def forward_backward_pipelining_without_interleaving(*,
             if num_warmup_microbatches >= 2:
                 onload_ctx.__exit__(None, None, None)
                 if i == 0:
+                    start = time.time()
                     offload_ctx.__exit__(None, None, None)
+                    offload_exit_total_time[0] += time.time() - start
                 if i + 1 < num_warmup_microbatches:
                     onload_ctx = offload.onload_async(backward_id + 1)
+                    start = time.time()
                     onload_ctx.__enter__()
+                    onload_enter_time[0] += time.time() - start
 
             input_tensor_grad = \
                 backward_step(grad_scaler, input_tensor, output_tensor,
@@ -1345,5 +1370,9 @@ def forward_backward_pipelining_without_interleaving(*,
         enable_grad_sync()
         if grad_sync_func is not None:
             grad_sync_func(model.parameters())
-
+    # if parallel_state.get_pipeline_model_parallel_rank() == 0:
+    #     print(f"rank{parallel_state.get_pipeline_model_parallel_rank()} offload enter time: {offload_enter_total_time[0] }")
+    #     print(f"rank{parallel_state.get_pipeline_model_parallel_rank()} offload exit time: {offload_exit_total_time[0]}")
+    #     print(f"rank{parallel_state.get_pipeline_model_parallel_rank()} onload enter time: {onload_enter_time[0] }")
+    #     print(f"rank{parallel_state.get_pipeline_model_parallel_rank()} onload exit time: {onload_exit_time[0] }")
     return forward_data_store
