@@ -15,11 +15,11 @@ cd ~/Megatron-Kwai/examples/atc24
 
 | Strategy | elapsed time per iteration(ms) | tokens per sec per gpu| cuda memory allocated(GiB) |
 |--|--|--|--|
-| offload every layer(ours) | 34721.1 | 7549 | 45.3G |
-| offload every other layer(ours) | 34867.4 | 7518 | 47.8G|
-| no checkpoint | 34721.9 | 7549 | 66.8G |
-| selective recompute | 34859.4 | 7520 | 49.8G |
-| full recompute | 43958.2 | 5963 | 35.8G |
+| offload every layer(ours) | 34854.27 | 7521.20 | 45.3G |
+| offload every other layer(ours) | 35109.92 | 7466.71 | 47.8G|
+| no checkpoint | 34952.90 | 7500.24 | 66.8G |
+| selective recompute | 35065.81 | 7476.00 | 49.8G |
+| full recompute | 43960.24 | 5963.25 | 35.8G |
 
 #### offload every layer attention activation(ours)
 max cuda memory allocated 45.3G
