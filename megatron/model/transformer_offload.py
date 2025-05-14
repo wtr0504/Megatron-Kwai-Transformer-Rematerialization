@@ -31,6 +31,7 @@ def get_gpu_buffer(key, cpu_buffer_like):
     with gpu_buffer_lock:
         if key not in _GPU_BUFFER_POOL or _GPU_BUFFER_POOL[key].numel() < cpu_buffer_like.numel():
             _GPU_BUFFER_POOL[key] = None
+            # empty_like() is faster than empty() , maybe because of the COW allocation
             _GPU_BUFFER_POOL[key] = torch.empty_like(cpu_buffer_like,device="cuda")
             _GPU_BUFFER_POOL[key].ref_cnt = 0  # ref_cnt supports ping_pong onload
             total_size[0] += cpu_buffer_like.numel() * cpu_buffer_like.element_size()

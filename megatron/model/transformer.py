@@ -1989,6 +1989,7 @@ class ParallelTransformer(MegatronModule):
                         forward_kwargs['retriever_output'] = retriever_output
                         forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
 
+                    # the following code is for offload transformer layer
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
                         if True:
@@ -2050,5 +2051,4 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
         torch.cuda.memory._dump_snapshot(f"full_recompute.pickle")
-        # print("o")
         return hidden_states
